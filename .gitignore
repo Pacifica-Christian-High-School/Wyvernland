@@ -1,0 +1,34 @@
+# Unity-generated data and local build output
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Bb]uild/
+/[Bb]uilds/
+/[Mm]emory[Cc]aptures/
+/[Rr]ecordings/
+
+# Local validation projects, exports, and backups
+/Artifacts/
+/Backups/
+/TempDestructionCheck/
+/TempValidationProject/
+/TempValidationProject2/
+
+# Generated IDE files
+/.vs/
+/.idea/
+*.csproj
+*.sln
+*.slnx
+*.suo
+*.user
+*.userprefs
+*.pdb
+*.mdb
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db

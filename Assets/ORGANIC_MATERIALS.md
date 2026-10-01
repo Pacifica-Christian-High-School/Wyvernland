@@ -1,0 +1,26 @@
+# Organic Materials
+
+- Grass Stem
+- Grass Leaf
+- Grass Root
+- Unpeeled Wood Piece
+- Peeled Wood Piece
+- Bark
+- Grass Fiber
+- Wood Fiber
+- Black Vine
+- Yellow Vine
+- Unpeeled Wood Root
+- Peeled Wood Root
+- Charcoal
+- Unpeeled Wood Stick
+- Peeled Wood Stick
+- Red Resin
+- Yellow Resin
+- Black Resin
+- Clay
+- Mud
+- Soil
+- Sand Soil
+- Scorched Soil
+- Ash
