@@ -4,272 +4,199 @@ using UnityEngine.Rendering;
 
 namespace Wyvernland
 {
-    /// <summary>Seeded, terrain-aligned pixel silhouettes, streamed in small meshes.</summary>
+    // Surface data and one shared mesh describe grass for the entire resident map.
+    // Visibility changes draw submission only; movement never creates or unloads it.
     public sealed class ProceduralGrass : MonoBehaviour
     {
-        private const float TileSize = 32f;
-        private const float DefaultDrawDistance = 320f;
-        private const float MaximumDrawDistance = 240f;
-        private const float FadeInDuration = 1.25f;
-        private readonly Dictionary<Vector2Int, GameObject> tiles = new();
-        private readonly List<Vector2Int> pending = new();
-        private readonly List<Vector2Int> expired = new();
-        private Transform observer;
-        private ProceduralMap map;
-        private WorldObjectStreaming streaming;
+        private const int PatchWidth=32;
+        private struct Patch { public Matrix4x4 Matrix; public Bounds Bounds; }
+        private struct Instance { public Matrix4x4 objectToWorld; }
+        private readonly List<Patch> patches=new();
+        private readonly Instance[] visible=new Instance[1023];
+        private readonly Plane[] planes=new Plane[6];
+        private Camera playerCamera;
         private Material material;
-        private float drawDistance=DefaultDrawDistance;
-        private Vector2Int lastTile = new(int.MinValue, int.MinValue);
-        public float Density { get; private set; } = 1f;
+        private Mesh mesh;
+        private RenderTexture surfaceMap;
+        private Texture2D densityMap;
+        private Rect bounds;
+        private int minimumX,minimumZ,columns,rows;
+        internal const float BrowserDrawDistance=128f;
+        public float Density { get; private set; }=1f;
+        public int ResidentPatchCount => patches.Count;
+        public int LastDrawnPatchCount { get; private set; }
+        public int LastVisitedPatchCount { get; private set; }
 
-        // The shader clips one quad into each of these original pixel dimensions.
-        private static readonly float[] ShapeHeights = { 9f, 9f, 13f };
-        private static readonly float[] ShapeWidths = { 11f, 13f, 14f };
-        private static readonly Color[] Palette =
+        public void Initialize(FirstPersonController player,ProceduralMap map)
         {
-            new Color32(190, 122, 86, 255),
-            new Color32(176, 79, 31, 255),
-            new Color32(128, 55, 25, 255)
-        };
+            var routine=InitializeIncrementally(player,map);
+            while(routine.MoveNext()) { }
+        }
 
-        public void Initialize(FirstPersonController player, ProceduralMap terrain)
+        internal System.Collections.IEnumerator InitializeIncrementally(FirstPersonController player,ProceduralMap map)
         {
-            observer = player.transform;
-            map = terrain;
-            streaming = FindFirstObjectByType<WorldObjectStreaming>();
-            drawDistance=Mathf.Min(streaming!=null?streaming.LoadingRange:DefaultDrawDistance,
-                MaximumDrawDistance);
+            playerCamera=player.PlayerCamera;
+            bounds=map.Bounds;
             Density=Mathf.Clamp01(PlayerPrefs.GetFloat("Options.GrassDensity",1f));
-            Shader shader = Resources.Load<Shader>("Grass");
-            if (shader == null) throw new System.InvalidOperationException("Missing grass shader.");
-            material = new Material(shader) { name = "Three-color translucent grass" };
-            material.SetFloat("_DrawDistance",drawDistance);
-            material.SetFloat("_FadeStart",drawDistance*0.45f);
-            material.SetFloat("_FadeDuration", FadeInDuration);
-        }
-
-        private static int Seed(int x, int z)
-        {
-            unchecked { return ((x * 73856093) ^ (z * 19349663) ^ 51797) & int.MaxValue; }
-        }
-
-        private static uint Hash(int x,int z,int salt)
-        {
-            unchecked
+            material=new Material(Resources.Load<Shader>("Grass"))
+                { name="Resident GPU grass",enableInstancing=true };
+            material.SetVector("_GrassMapBounds",new Vector4(bounds.xMin,bounds.yMin,
+                1f/bounds.width,1f/bounds.height));
+            BuildSurfaceMap(map);
+            yield return null;
+            var distribution=BuildDensityMap(FindFirstObjectByType<ProceduralTreeField>());
+            while(distribution.MoveNext()) yield return distribution.Current;
+            BuildSharedMesh();
+            float vertical=WorldBootstrap.TestGround?2f:WorldConfig.MaximumElevation+2f;
+            minimumX=Mathf.FloorToInt(bounds.xMin/PatchWidth);minimumZ=Mathf.FloorToInt(bounds.yMin/PatchWidth);
+            columns=Mathf.CeilToInt(bounds.xMax/PatchWidth)-minimumX;
+            rows=Mathf.CeilToInt(bounds.yMax/PatchWidth)-minimumZ;
+            for(int z=minimumZ;z<minimumZ+rows;z++)
+            for(int x=minimumX;x<minimumX+columns;x++)
             {
-                uint value=(uint)(x*73856093)^(uint)(z*19349663)^(uint)salt;
-                value^=value>>16;
-                value*=0x7feb352du;
-                value^=value>>15;
-                value*=0x846ca68bu;
-                return value^(value>>16);
+                Vector3 position=new(x*PatchWidth,0,z*PatchWidth);
+                patches.Add(new Patch { Matrix=Matrix4x4.Translate(position),
+                    Bounds=new Bounds(position+new Vector3(PatchWidth*.5f,vertical*.5f,PatchWidth*.5f),
+                        new Vector3(PatchWidth+2f,vertical,PatchWidth+2f)) });
             }
         }
 
-        private static float Hash01(int x,int z,int salt) =>
-            (Hash(x,z,salt)&0x00ffffffu)/16777216f;
-
-        private static Color RegionalColor(float x, float z, System.Random grassRandom)
+        private void BuildSurfaceMap(ProceduralMap map)
         {
-            const float regionSize = 266f;
-            const float blendWidth = 198f;
-            int cellX = Mathf.FloorToInt(x/regionSize);
-            int cellZ = Mathf.FloorToInt(z/regionSize);
-            float nearest = float.PositiveInfinity, second = float.PositiveInfinity;
-            int nearestColor = 0, secondColor = 0;
-            for (int dz = -1; dz <= 1; dz++)
-            for (int dx = -1; dx <= 1; dx++)
+            int resolution=WorldBootstrap.TestGround?512:2048;
+            surfaceMap=new RenderTexture(resolution,resolution,24,RenderTextureFormat.ARGBFloat,
+                RenderTextureReadWrite.Linear)
+            { name="Resident grass heights and normals",filterMode=FilterMode.Point,
+                wrapMode=TextureWrapMode.Clamp };
+            surfaceMap.Create();
+            var bake=new Material(Resources.Load<Shader>("GrassSurfaceBake"));
+            bake.SetVector("_GrassMapBounds",new Vector4(bounds.xMin,bounds.yMin,
+                1f/bounds.width,1f/bounds.height));
+            var commands=new CommandBuffer { name="Bake resident grass surface" };
+            commands.SetRenderTarget(surfaceMap);
+            commands.ClearRenderTarget(true,true,new Color(ProceduralMap.FallLimit,0,0,0));
+            map.DrawGrassSurface(commands,bake);
+            Graphics.ExecuteCommandBuffer(commands);
+            commands.Release();
+            Release(bake);
+            material.SetTexture("_GrassSurfaceMap",surfaceMap);
+            material.SetVector("_GrassSurfaceGrid",new Vector4(resolution,resolution,
+                bounds.width/resolution,bounds.height/resolution));
+        }
+
+        private System.Collections.IEnumerator BuildDensityMap(ProceduralTreeField trees)
+        {
+            const int resolution=512;
+            var pixels=new Color[resolution*resolution];
+            bool test=WorldBootstrap.TestGround;
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            for(int z=0;z<resolution;z++)
             {
-                int gx = cellX+dx, gz = cellZ+dz;
-                Vector2 centre = new((gx+0.18f+Hash01(gx,gz,0x35a17)*0.64f)*regionSize,
-                    (gz+0.18f+Hash01(gx,gz,0x4c921)*0.64f)*regionSize);
-                float distance = Vector2.Distance(new Vector2(x,z),centre);
-                int color = (int)(Hash(gx,gz,0x72bd1)%Palette.Length);
-                if (distance < nearest)
+                for(int x=0;x<resolution;x++)
                 {
-                    second = nearest; secondColor = nearestColor;
-                    nearest = distance; nearestColor = color;
+                float px=bounds.xMin+(x+.5f)/resolution*bounds.width;
+                float pz=bounds.yMin+(z+.5f)/resolution*bounds.height;
+                if(test) { pixels[z*resolution+x]=new Color(px<-.5f?1f:0f,0,0,1); continue; }
+                float baseDensity=ProceduralMap.GrassDensity(px,pz)*.7f;
+                float treeDensity=trees!=null?trees.GrassAroundTrees(px,pz):0f;
+                float pile=GroundFeatureLayout.PileGrassDensity(px,pz);
+                float density=pile>=0f?pile:Mathf.Max(baseDensity,treeDensity);
+                if(ProceduralMonumentField.ContainsInterior(px,pz,3f)||
+                    !GroundFeatureLayout.AllowsGrass(px,pz)) density=0f;
+                pixels[z*resolution+x]=new Color(density,pile>=0f?1f:0f,
+                    treeDensity>baseDensity?1f:0f,1f);
                 }
-                else if (distance < second)
-                {
-                    second = distance; secondColor = color;
-                }
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
             }
-            float neighborMix = nearestColor == secondColor ? 0f :
-                0.5f*(1f-Mathf.SmoothStep(0f,1f,(second-nearest)/blendWidth));
-            Color colorValue = Color.Lerp(Palette[nearestColor],Palette[secondColor],neighborMix);
-            // Keep variation inside a region small enough to read as one color.
-            Color.RGBToHSV(colorValue,out float hue,out float saturation,out float value);
-            hue = Mathf.Repeat(hue+((float)grassRandom.NextDouble()-0.5f)*0.0192f,1f);
-            saturation = Mathf.Clamp01(saturation*Mathf.Lerp(0.952f,1.048f,(float)grassRandom.NextDouble()));
-            value = Mathf.Clamp01(value*Mathf.Lerp(0.936f,1.064f,(float)grassRandom.NextDouble()));
-            return Color.HSVToRGB(hue,saturation,value);
+            densityMap=new Texture2D(resolution,resolution,TextureFormat.RGBA32,false,true)
+                { name="Resident grass distribution",filterMode=FilterMode.Bilinear,
+                    wrapMode=TextureWrapMode.Clamp };
+            densityMap.SetPixels(pixels);
+            densityMap.Apply(false,true);
+            material.SetTexture("_GrassDensityMap",densityMap);
         }
 
-        private void Update()
+        private void BuildSharedMesh()
         {
-            if (observer == null) return;
-            float requestedRange=Mathf.Min(
-                streaming!=null?streaming.LoadingRange:DefaultDrawDistance,MaximumDrawDistance);
-            if(!Mathf.Approximately(requestedRange,drawDistance))
+            var vertices=new Vector3[PatchWidth*PatchWidth*4];
+            var uv=new Vector2[vertices.Length];
+            var triangles=new int[PatchWidth*PatchWidth*6];
+            for(int z=0;z<PatchWidth;z++)
+            for(int x=0;x<PatchWidth;x++)
             {
-                drawDistance=requestedRange;
-                material.SetFloat("_DrawDistance",drawDistance);
-                material.SetFloat("_FadeStart",drawDistance*0.45f);
-                lastTile=new Vector2Int(int.MinValue,int.MinValue);
+                int first=(z*PatchWidth+x)*4,tri=(z*PatchWidth+x)*6;
+                for(int corner=0;corner<4;corner++) vertices[first+corner]=new Vector3(x,0,z);
+                uv[first]=Vector2.zero;uv[first+1]=Vector2.up;
+                uv[first+2]=Vector2.one;uv[first+3]=Vector2.right;
+                triangles[tri]=first;triangles[tri+1]=first+1;triangles[tri+2]=first+2;
+                triangles[tri+3]=first;triangles[tri+4]=first+2;triangles[tri+5]=first+3;
             }
-            Vector2Int current = new(Mathf.FloorToInt(observer.position.x / TileSize),
-                Mathf.FloorToInt(observer.position.z / TileSize));
-            if (current != lastTile)
-            {
-                int tileRadius = Mathf.CeilToInt((drawDistance+TileSize)/TileSize);
-                int tileRadiusSquared = tileRadius*tileRadius;
-                lastTile = current;
-                pending.Clear();
-                expired.Clear();
-                foreach (var tile in tiles)
-                    if ((tile.Key-current).sqrMagnitude > tileRadiusSquared) expired.Add(tile.Key);
-                foreach (Vector2Int key in expired)
-                {
-                    Release(tiles[key]);
-                    tiles.Remove(key);
-                }
-                // Extra tile margin keeps the 80 m fade band fully populated.
-                for (int z = -tileRadius; z <= tileRadius; z++)
-                for (int x = -tileRadius; x <= tileRadius; x++)
-                {
-                    Vector2Int key = current + new Vector2Int(x,z);
-                    if (x*x+z*z <= tileRadiusSquared && !tiles.ContainsKey(key)&&
-                        TileIntersectsMap(key)) pending.Add(key);
-                }
-                pending.Sort((a,b) => (b-current).sqrMagnitude.CompareTo((a-current).sqrMagnitude));
-            }
-            // Near tiles first. Larger tiles substantially reduce renderer count;
-            // limiting construction to one per frame avoids a generation spike.
-            for (int i = 0; i < 1 && pending.Count > 0; i++)
-            {
-                int index = pending.Count-1;
-                Vector2Int key = pending[index];
-                pending.RemoveAt(index);
-                tiles[key] = BuildTile(key);
-            }
+            mesh=new Mesh { name="Shared 1024-clump grass patch",vertices=vertices,
+                uv=uv,triangles=triangles,
+                bounds=new Bounds(new Vector3(16,170,16),new Vector3(34,344,34)) };
+            mesh.UploadMeshData(true);
         }
 
-        private bool TileIntersectsMap(Vector2Int key)
+        private void LateUpdate()
         {
-            Rect bounds=map.Bounds;
-            float minX=key.x*TileSize,minZ=key.y*TileSize;
-            return minX<bounds.xMax&&minX+TileSize>bounds.xMin&&
-                minZ<bounds.yMax&&minZ+TileSize>bounds.yMin;
-        }
-
-        private GameObject BuildTile(Vector2Int key)
-        {
-            var random = new System.Random(Seed(key.x,key.y));
-            float Next() => (float)random.NextDouble();
-            Vector3 origin = new(key.x*TileSize,0,key.y*TileSize);
-            // Preserve the original density while batching four times the land area.
-            // Stratification keeps density even without a visibly regular grid.
-            int rows = random.Next(Mathf.RoundToInt(TileSize*0.9375f),
-                Mathf.RoundToInt(TileSize)+1);
-            int maximumClumps=rows*rows;
-            var vertices = new List<Vector3>(maximumClumps*4);
-            var colors = new List<Color>(maximumClumps*4);
-            var uvs = new List<Vector3>(maximumClumps*4);
-            var indices = new List<int>(maximumClumps*6);
-            float spacing = TileSize/rows;
-            for (int z = 0; z < rows; z++)
-            for (int x = 0; x < rows; x++)
+            LastDrawnPatchCount=0;
+            LastVisitedPatchCount=0;
+            // Initialization yields while the density map is being built.
+            if(playerCamera==null||Density<=0f||mesh==null||columns<=0||rows<=0||patches.Count<columns*rows) return;
+            GeometryUtility.CalculateFrustumPlanes(playerCamera,planes);
+            material.SetFloat("_GrassDensity",Density);
+            material.SetFloat("_MediumTextureQuality",ColorOnlyTextureQuality.Level==TextureQualityLevel.Medium?1:0);
+            float pixelsPerMetre=playerCamera.pixelHeight/(2f*Mathf.Tan(playerCamera.fieldOfView*Mathf.Deg2Rad*.5f));
+            material.SetFloat("_GrassPixelsPerMetre",pixelsPerMetre);
+            // A blade smaller than half a pixel cannot resolve its silhouette.
+            float limit=pixelsPerMetre*2f+PatchWidth;
+            if(Application.platform==RuntimePlatform.WebGLPlayer) limit=Mathf.Min(limit,BrowserDrawDistance);
+            limit=Mathf.Min(limit,PlayerWorldLoading.LocalRange);
+            float squared=limit*limit;
+            Vector3 eye=playerCamera.transform.position;
+            var parameters=new RenderParams(material) {
+                camera=playerCamera,shadowCastingMode=ShadowCastingMode.Off,receiveShadows=false,
+                worldBounds=new Bounds(new Vector3(bounds.center.x,170,bounds.center.y),
+                    new Vector3(bounds.width+64,400,bounds.height+64)) };
+            int count=0;
+            RectInt window=PatchWindow(bounds,eye,limit);
+            for(int z=window.yMin;z<window.yMax;z++)
+            for(int x=window.xMin;x<window.xMax;x++)
             {
-                float px = origin.x + (x+0.25f+Next()*0.5f)*spacing;
-                float pz = origin.z + (z+0.25f+Next()*0.5f)*spacing;
-                bool testGround = WorldBootstrap.TestGround;
-                if (testGround && (px < -99.5f || px >= -0.5f || Mathf.Abs(pz) > 99.5f)) continue;
-                float mapDensity=testGround ? 1f : ProceduralMap.GrassDensity(px,pz)*0.7f;
-                float treeDensity=streaming!=null?streaming.GrassAroundTrees(px,pz):0f;
-                float pileDensity=testGround ? -1f : GroundFeatureLayout.PileGrassDensity(px,pz);
-                float areaDensity=pileDensity>=0f?pileDensity:Mathf.Max(mapDensity,treeDensity);
-                if (Density<=0f||Next()>areaDensity*Density||
-                    (!testGround && (ProceduralMap.IsRiverbed(px,pz)||
-                    ProceduralMonumentField.ContainsInterior(px,pz,3f)||
-                    !GroundFeatureLayout.AllowsGrass(px,pz)))||
-                    !map.TryGetSurface(px,pz,out RaycastHit surface)) continue;
-                if (surface.normal.y <= 0.25f) continue;
-                // Independent 7 m patches choose single, paired or triple mixes.
-                int patchX=Mathf.FloorToInt(px/7f),patchZ=Mathf.FloorToInt(pz/7f);
-                int first=(int)(Hash(patchX,patchZ,0x2a531)%3u);
-                int count=1+(int)(Hash(patchX,patchZ,0x61c47)%3u);
-                int step=(Hash(patchX,patchZ,0x17d39)&1u)==0u?1:2;
-                int type = (first+step*random.Next(count))%3;
-                float height=pileDensity>=0f?Mathf.Lerp(0.18f,0.45f,Next()):
-                    Mathf.Lerp(treeDensity>mapDensity?0.5f:0.4f,1f,Next());
-                float scale = height/ShapeHeights[type];
-                Color color = RegionalColor(px,pz,random);
-                if (QualitySettings.activeColorSpace == ColorSpace.Linear) color = color.linear;
-                color.a = Mathf.Lerp(0.4f,0.6f,Next());
-                Quaternion rotation = Quaternion.FromToRotation(Vector3.up,surface.normal) *
-                    Quaternion.Euler(0,Next()*360f,0);
-                Vector3 up = rotation*Vector3.up;
-                Vector3 right = rotation*Vector3.right;
-                Vector3 root = surface.point-origin+surface.normal*0.002f;
-                float halfWidth=ShapeWidths[type]*scale*0.5f;
-                int start = vertices.Count;
-                vertices.Add(root-right*halfWidth);
-                vertices.Add(root-right*halfWidth+up*height);
-                vertices.Add(root+right*halfWidth+up*height);
-                vertices.Add(root+right*halfWidth);
-                for (int n = 0; n < 4; n++) colors.Add(color);
-                uvs.Add(new Vector3(0f,0f,type)); uvs.Add(new Vector3(0f,1f,type));
-                uvs.Add(new Vector3(1f,1f,type)); uvs.Add(new Vector3(1f,0f,type));
-                indices.Add(start); indices.Add(start+1); indices.Add(start+2);
-                indices.Add(start); indices.Add(start+2); indices.Add(start+3);
+                Patch patch=patches[(z-minimumZ)*columns+x-minimumX];LastVisitedPatchCount++;
+                if(patch.Bounds.SqrDistance(eye)>squared||!GeometryUtility.TestPlanesAABB(planes,patch.Bounds)) continue;
+                visible[count++].objectToWorld=patch.Matrix;
+                LastDrawnPatchCount++;
+                if(count==visible.Length)
+                { Graphics.RenderMeshInstanced(parameters,mesh,0,visible,count); count=0; }
             }
-            if (vertices.Count == 0) return null;
-            Mesh mesh = new() { name = $"Grass patch {key}" };
-            mesh.SetVertices(vertices); mesh.SetTriangles(indices,0); mesh.SetColors(colors);
-            mesh.SetUVs(0,uvs);
-            mesh.RecalculateNormals();
-            mesh.RecalculateBounds();
-            GameObject tile = new($"Grass {key.x}, {key.y}");
-            tile.transform.SetParent(transform,false);
-            tile.transform.position = origin;
-            tile.AddComponent<MeshFilter>().sharedMesh = mesh;
-            MeshRenderer renderer = tile.AddComponent<MeshRenderer>();
-            renderer.sharedMaterial = material;
-            MaterialPropertyBlock properties = new();
-            properties.SetFloat("_SpawnTime", Time.timeSinceLevelLoad);
-            renderer.SetPropertyBlock(properties);
-            renderer.shadowCastingMode = ShadowCastingMode.Off;
-            renderer.receiveShadows = false;
-            return tile;
+            if(count>0) Graphics.RenderMeshInstanced(parameters,mesh,0,visible,count);
+        }
+        internal static RectInt PatchWindow(Rect area,Vector3 eye,float distance)
+        {
+            int minX=Mathf.Max(Mathf.FloorToInt(area.xMin/PatchWidth),Mathf.FloorToInt((eye.x-distance)/PatchWidth)-1);
+            int minZ=Mathf.Max(Mathf.FloorToInt(area.yMin/PatchWidth),Mathf.FloorToInt((eye.z-distance)/PatchWidth)-1);
+            int maxX=Mathf.Min(Mathf.CeilToInt(area.xMax/PatchWidth),Mathf.FloorToInt((eye.x+distance)/PatchWidth)+2);
+            int maxZ=Mathf.Min(Mathf.CeilToInt(area.yMax/PatchWidth),Mathf.FloorToInt((eye.z+distance)/PatchWidth)+2);
+            return new RectInt(minX,minZ,Mathf.Max(0,maxX-minX),Mathf.Max(0,maxZ-minZ));
         }
 
         public void SetDensity(float value)
         {
-            value=Mathf.Clamp01(value);
-            if(Mathf.Approximately(value,Density)) return;
-            Density=value;
+            Density=Mathf.Clamp01(value);
             PlayerPrefs.SetFloat("Options.GrassDensity",Density);
             PlayerPrefs.Save();
-            foreach(GameObject tile in tiles.Values) Release(tile);
-            tiles.Clear();
-            pending.Clear();
-            expired.Clear();
-            lastTile=new Vector2Int(int.MinValue,int.MinValue);
-        }
-
-        private void Release(GameObject tile)
-        {
-            if (tile == null) return;
-            tile.SetActive(false);
-            Destroy(tile.GetComponent<MeshFilter>().sharedMesh);
-            Destroy(tile);
         }
 
         private void OnDestroy()
         {
-            foreach (GameObject tile in tiles.Values) Release(tile);
-            if (material != null) Destroy(material);
+            if(surfaceMap!=null) { surfaceMap.Release(); Release(surfaceMap); }
+            if(densityMap!=null) Release(densityMap);
+            if(mesh!=null) Release(mesh);
+            if(material!=null) Release(material);
         }
+        private static void Release(Object value)
+        { if(Application.isPlaying) Destroy(value); else DestroyImmediate(value); }
     }
 }

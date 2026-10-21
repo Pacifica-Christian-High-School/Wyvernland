@@ -1,64 +1,231 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 namespace Wyvernland
 {
-    // Runtime-only tiles retain their original triangles. Cuts are replayed only
-    // on intersecting triangles, so overlapping excavations cannot fill old pits.
+    // Island geometry is divided into 100m tiles. Excavation prepares and
+    // rebuilds one affected tile at a time, then releases its temporary faces.
     public sealed class StoneTerrainCutout : IDisposable
     {
-        private const float TileSize=64f;
-        private readonly List<Tile> tiles=new();
-        private readonly Dictionary<Vector2Int,List<Tile>> columns=new();
+        private readonly List<Surface> surfaces=new();
+        private readonly Dictionary<Vector2Int,List<Surface>> surfaceCells=new();
         private readonly Transform root;
         private bool batching;
-        private readonly HashSet<Tile> dirty=new();
-        private readonly List<RenderBatch> renderBatches=new();
-        private readonly HashSet<RenderBatch> dirtyRenderBatches=new();
-        public void BeginBatch() { batching=true; }
+        private readonly HashSet<Surface> dirty=new();
+        private const float IndexCellSize=32f;
+        public int LastRebuiltSurfaceCount { get; private set; }
+        public StoneTerrainCutout(Transform root) { this.root=root; }
+        public void BeginBatch() => batching=true;
+
+        // The browser export stores the deterministic pits as finished 100m
+        // tiles. Cutter history is retained for original-height queries and
+        // any subsequent cuts, without redoing Boolean work during loading.
+        public void WriteBrowserPitTiles(Stream destination)
+        {
+            using var writer=new BinaryWriter(destination,System.Text.Encoding.UTF8,true);
+            writer.Write(0x57504954); writer.Write(1); writer.Write(TerrainTiles.Size);
+            var changed=surfaces.Where(s=>s.OwnsMesh).ToList();
+            var cutters=new List<Cut>(); var ids=new Dictionary<Cut,int>();
+            foreach(Surface surface in changed)
+                foreach(Cut cut in surface.Cuts)
+                    if(!ids.ContainsKey(cut)) { ids.Add(cut,cutters.Count);cutters.Add(cut); }
+            writer.Write(cutters.Count);
+            foreach(Cut cut in cutters)
+            {
+                WriteVector(writer,cut.Bounds.center);WriteVector(writer,cut.Bounds.size);
+                writer.Write(cut.Points.Length);
+                foreach(Vector3 point in cut.Points) WriteVector(writer,point);
+                writer.Write(cut.Triangles.Length);
+                foreach(int index in cut.Triangles) writer.Write(index);
+            }
+            writer.Write(changed.Count);
+            foreach(Surface surface in changed)
+            {
+                writer.Write(surface.OriginalMesh.name);
+                Vector3[] points=surface.DrawMesh.vertices;
+                Color[] colors=surface.DrawMesh.colors;
+                int[] triangles=surface.DrawMesh.triangles;
+                writer.Write(points.Length);
+                for(int i=0;i<points.Length;i++)
+                { WriteVector(writer,points[i]);writer.Write((byte)(colors[i].r<.9f?1:0)); }
+                writer.Write(triangles.Length);
+                foreach(int index in triangles) writer.Write(index);
+                writer.Write(surface.Cuts.Count);
+                foreach(Cut cut in surface.Cuts) writer.Write(ids[cut]);
+            }
+        }
+
+        internal System.Collections.IEnumerator ReadBrowserPitTiles(Stream source)
+        {
+            using var reader=new BinaryReader(source,System.Text.Encoding.UTF8,true);
+            if(reader.ReadInt32()!=0x57504954||reader.ReadInt32()!=1||reader.ReadSingle()!=TerrainTiles.Size)
+                throw new InvalidDataException("Invalid browser terrain cache. Rebuild the browser game.");
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            var cutters=new Cut[reader.ReadInt32()];
+            for(int i=0;i<cutters.Length;i++)
+            {
+                var cut=new Cut { Bounds=new Bounds(ReadVector(reader),ReadVector(reader)) };
+                cut.Points=new Vector3[reader.ReadInt32()];
+                for(int j=0;j<cut.Points.Length;j++) cut.Points[j]=ReadVector(reader);
+                cut.Triangles=new int[reader.ReadInt32()];
+                for(int j=0;j<cut.Triangles.Length;j++) cut.Triangles[j]=reader.ReadInt32();
+                cutters[i]=cut;
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            var byName=surfaces.ToDictionary(s=>s.OriginalMesh.name);
+            int total=reader.ReadInt32(); LastRebuiltSurfaceCount=0;
+            for(int i=0;i<total;i++)
+            {
+                string name=reader.ReadString();
+                if(!byName.TryGetValue(name,out Surface surface))
+                    throw new InvalidDataException($"Browser terrain tile {name} does not match this map.");
+                var points=new Vector3[reader.ReadInt32()];var colors=new Color[points.Length];
+                for(int j=0;j<points.Length;j++)
+                { points[j]=ReadVector(reader);colors[j]=reader.ReadByte()==0?Color.white:new Color(.55f,.55f,.55f,1); }
+                var indices=new int[reader.ReadInt32()];
+                for(int j=0;j<indices.Length;j++) indices[j]=reader.ReadInt32();
+                int count=reader.ReadInt32();
+                for(int j=0;j<count;j++)
+                {
+                    Cut cut=cutters[reader.ReadInt32()];surface.Cuts.Add(cut);Index(surface.CutCells,cut.Bounds,cut);
+                }
+                var mesh=new Mesh { name=name+" browser pits",indexFormat=IndexFormat.UInt32 };
+                mesh.vertices=points;mesh.colors=colors;mesh.triangles=indices;
+                mesh.RecalculateNormals();mesh.RecalculateBounds();
+                // Shared draw vertices also describe the exact collision solid.
+                // The terrain shader derives flat normals from each triangle.
+                ReplaceMeshes(surface,mesh,mesh);
+                LastRebuiltSurfaceCount++;WorldLoading.ReportTerrainTiles(i+1,total);
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            if(source.Position!=source.Length) throw new InvalidDataException("Unexpected browser terrain cache data.");
+        }
+
+        static void WriteVector(BinaryWriter writer,Vector3 value)
+        { writer.Write(value.x);writer.Write(value.y);writer.Write(value.z); }
+        static Vector3 ReadVector(BinaryReader reader) => new(reader.ReadSingle(),reader.ReadSingle(),reader.ReadSingle());
         public void EndBatch()
         {
-            batching=false;
-            LastRebuiltTileCount=0;
-            foreach(var tile in dirty) Rebuild(tile);
-            dirty.Clear();
-            FlushRenderBatches();
+            var routine=EndBatchIncrementally();
+            while(routine.MoveNext()) { }
         }
-        public int LastRebuiltTileCount { get; private set; }
-        public StoneTerrainCutout(Transform root) { this.root=root; }
 
-        // Sample immutable source faces so later stone batches never settle into
-        // cavities prepared by an earlier frame.
+        internal System.Collections.IEnumerator EndBatchIncrementally()
+        {
+            batching=false;
+            LastRebuiltSurfaceCount=0;
+            int completed=0,total=dirty.Count;
+            foreach(Surface surface in dirty)
+            {
+                var rebuild=RebuildIncrementally(surface);
+                while(rebuild.MoveNext()) yield return rebuild.Current;
+                rebuild=null;
+                ReleaseTemporaryFaces(surface);
+                WorldLoading.ReportTerrainTiles(++completed,total);
+                // Let deferred mesh destruction and WebGL collection finish
+                // before allocating preparation geometry for the next tile.
+                yield return null;
+            }
+            dirty.Clear();
+        }
+
+        internal System.Collections.IEnumerator PrepareSurfacesIncrementally()
+        {
+            foreach(Surface surface in surfaces)
+            {
+                if(surface.Original!=null) continue;
+                var preparation=PrepareSurfaceIncrementally(surface);
+                while(preparation.MoveNext()) yield return preparation.Current;
+            }
+        }
+
+        private System.Collections.IEnumerator PrepareSurfaceIncrementally(Surface surface)
+        {
+            Vector3[] vertices=surface.OriginalMesh.vertices;
+            int[] triangles=surface.OriginalMesh.triangles;
+            surface.Original=new List<Face>(triangles.Length/3);
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            for(int i=0;i<triangles.Length;i+=3)
+            {
+                Face face=new(new[]{vertices[triangles[i]],vertices[triangles[i+1]],vertices[triangles[i+2]]});
+                if(face.Valid)
+                {
+                    surface.Original.Add(face);
+                    if(face.Normal.y>0.001f) Index(surface.OriginalCells,face.Bounds,face);
+                }
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            foreach (Cut cut in surface.Cuts)
+                foreach (Face face in Query(surface.OriginalCells,cut.Bounds))
+                    if (face.Bounds.Intersects(cut.Bounds)) surface.AffectedFaces.Add(face);
+        }
+
+        private static void Index<T>(Dictionary<Vector2Int,List<T>> cells,Bounds bounds,T item,float cellSize=IndexCellSize)
+        {
+            for(int z=Mathf.FloorToInt(bounds.min.z/cellSize);z<=Mathf.FloorToInt(bounds.max.z/cellSize);z++)
+            for(int x=Mathf.FloorToInt(bounds.min.x/cellSize);x<=Mathf.FloorToInt(bounds.max.x/cellSize);x++)
+            {
+                var cell=new Vector2Int(x,z);
+                if(!cells.TryGetValue(cell,out var items)) cells[cell]=items=new List<T>();
+                items.Add(item);
+            }
+        }
+
+        private static IEnumerable<T> Query<T>(Dictionary<Vector2Int,List<T>> cells,Bounds bounds,float cellSize=IndexCellSize)
+        {
+            var seen=new HashSet<T>();
+            for(int z=Mathf.FloorToInt(bounds.min.z/cellSize);z<=Mathf.FloorToInt(bounds.max.z/cellSize);z++)
+            for(int x=Mathf.FloorToInt(bounds.min.x/cellSize);x<=Mathf.FloorToInt(bounds.max.x/cellSize);x++)
+                if(cells.TryGetValue(new Vector2Int(x,z),out var items))
+                    foreach(T item in items) if(seen.Add(item)) yield return item;
+        }
+
         public bool OriginalSurface(float x,float z,out RaycastHit hit)
         {
+            Ray ray=new(new Vector3(x,600f,z),Vector3.down);
             hit=default;
-            Vector3 start=root.InverseTransformPoint(new Vector3(x,600f,z));
-            Vector3 direction=root.InverseTransformVector(Vector3.down);
-            if(!columns.TryGetValue(new Vector2Int(Mathf.FloorToInt(start.x/TileSize),
-                Mathf.FloorToInt(start.z/TileSize)),out var column)) return false;
-            float closest=1800f;
+            float nearest=1800f;
             bool found=false;
-            foreach(var tile in column)
-            foreach(var face in tile.Original)
+            Vector3 start=root.InverseTransformPoint(ray.origin);
+            Vector3 direction=root.InverseTransformVector(ray.direction);
+            var rayBounds=new Bounds(start,Vector3.zero); rayBounds.Encapsulate(start+direction*nearest);
+            foreach(Surface surface in Query(surfaceCells,rayBounds,TerrainTiles.Size))
             {
-                float denominator=Vector3.Dot(face.Normal,direction);
-                if(denominator>=-0.000001f) continue;
-                Vector3 localStart=start-tile.Origin;
-                float distance=Vector3.Dot(face.Normal,face.Vertices[0]-localStart)/denominator;
-                if(distance<0||distance>closest) continue;
-                Vector3 point=localStart+direction*distance;
-                bool inside=true;
-                for(int i=0;i<face.Vertices.Count;i++)
-                    if(Vector3.Dot(Vector3.Cross(face.Vertices[(i+1)%face.Vertices.Count]-face.Vertices[i],
-                        point-face.Vertices[i]),face.Normal)<-0.00001f) { inside=false; break; }
-                if(!inside) continue;
-                closest=distance; found=true;
-                hit.point=root.TransformPoint(point+tile.Origin);
-                hit.normal=root.TransformDirection(face.Normal).normalized;
-                hit.distance=distance;
+                if(surface.Cuts.Count==0)
+                {
+                    if(!surface.Collider.Raycast(ray,out var candidate,nearest)) continue;
+                    hit=candidate; nearest=candidate.distance; found=true;
+                    continue;
+                }
+                // Original placement queries keep working after temporary pit
+                // faces are released, without retaining millions of Face objects.
+                Vector3[] vertices=surface.OriginalMesh.vertices;
+                int[] indices=surface.OriginalMesh.triangles;
+                for (int triangle=0; triangle<indices.Length; triangle+=3)
+                {
+                    Face face=new(new[]{vertices[indices[triangle]],vertices[indices[triangle+1]],vertices[indices[triangle+2]]});
+                    float denominator=Vector3.Dot(face.Normal,direction);
+                    if(denominator>=-0.000001f) continue;
+                    float distance=Vector3.Dot(face.Normal,face.Vertices[0]-start)/denominator;
+                    if(distance<0||distance>=nearest) continue;
+                    Vector3 point=start+direction*distance;
+                    bool inside=true;
+                    for(int i=0;i<face.Vertices.Count;i++)
+                        if(Vector3.Dot(Vector3.Cross(face.Vertices[(i+1)%face.Vertices.Count]-face.Vertices[i],
+                            point-face.Vertices[i]),face.Normal)<-0.00001f) { inside=false; break; }
+                    if(!inside) continue;
+                    nearest=distance; found=true;
+                    hit.point=root.TransformPoint(point);
+                    hit.normal=root.TransformDirection(face.Normal).normalized;
+                    hit.distance=distance;
+                }
             }
             return found;
         }
@@ -78,97 +245,216 @@ namespace Wyvernland
             var faces=new List<Vector3Int>(); int[] triangles=source.triangles;
             for(int i=0;i<triangles.Length;i+=3)
                 faces.Add(new Vector3Int(remap[triangles[i]],remap[triangles[i+1]],remap[triangles[i+2]]));
-            int target=Mathf.Max(4,((faces.Count/2+1)/2)*2);
-            while(faces.Count>target)
+            var active=new bool[faces.Count];
+            var incident=new HashSet<int>[points.Count];
+            for(int i=0;i<incident.Length;i++) incident[i]=new HashSet<int>();
+            for(int i=0;i<faces.Count;i++)
             {
-                var edges=new HashSet<(int a,int b)>();
-                foreach(var f in faces) for(int j=0;j<3;j++)
-                { int a=f[j],b=f[(j+1)%3]; edges.Add(a<b?(a,b):(b,a)); }
-                bool collapsed=false;
-                foreach(var edge in edges.OrderBy(e=>(points[e.a]-points[e.b]).sqrMagnitude))
-                {
-                    var adjacentA=new HashSet<int>(); var adjacentB=new HashSet<int>();
-                    int shared=0;
-                    foreach(var f in faces)
-                    {
-                        bool a=f.x==edge.a||f.y==edge.a||f.z==edge.a;
-                        bool b=f.x==edge.b||f.y==edge.b||f.z==edge.b;
-                        if(a&&b) shared++;
-                        for(int j=0;j<3;j++) { if(a) adjacentA.Add(f[j]); if(b) adjacentB.Add(f[j]); }
-                    }
-                    adjacentA.Remove(edge.a); adjacentA.Remove(edge.b);
-                    adjacentB.Remove(edge.a); adjacentB.Remove(edge.b); adjacentA.IntersectWith(adjacentB);
-                    if(shared!=2||adjacentA.Count!=2) continue;
-                    Vector3 midpoint=(points[edge.a]+points[edge.b])*0.5f;
-                    bool valid=true;
-                    foreach(var f in faces)
-                    {
-                        bool a=f.x==edge.a||f.y==edge.a||f.z==edge.a;
-                        bool b=f.x==edge.b||f.y==edge.b||f.z==edge.b;
-                        if((!a&&!b)||(a&&b)) continue;
-                        Vector3 p=f.x==edge.a||f.x==edge.b?midpoint:points[f.x];
-                        Vector3 q=f.y==edge.a||f.y==edge.b?midpoint:points[f.y];
-                        Vector3 r=f.z==edge.a||f.z==edge.b?midpoint:points[f.z];
-                        Vector3 oldNormal=Vector3.Cross(points[f.y]-points[f.x],points[f.z]-points[f.x]);
-                        Vector3 newNormal=Vector3.Cross(q-p,r-p);
-                        if(newNormal.sqrMagnitude<1e-20f||Vector3.Dot(oldNormal,newNormal)<=0f) { valid=false; break; }
-                    }
-                    if(!valid) continue;
-                    for(int i=faces.Count-1;i>=0;i--)
-                    {
-                        var f=faces[i]; for(int j=0;j<3;j++) if(f[j]==edge.b) f[j]=edge.a;
-                        if(f.x==f.y||f.y==f.z||f.z==f.x) faces.RemoveAt(i); else faces[i]=f;
-                    }
-                    points[edge.a]=midpoint; collapsed=true; break;
-                }
-                if(!collapsed) break;
+                active[i]=true;
+                for(int j=0;j<3;j++) incident[faces[i][j]].Add(i);
             }
-            var mesh=new Mesh{name="Stone pit cutter (50% faces)"};
-            mesh.SetVertices(points); mesh.SetTriangles(faces.SelectMany(f=>new[]{f.x,f.y,f.z}).ToArray(),0);
+            var edges=new CutterEdgeHeap();
+            var versions=new Dictionary<(int a,int b),int>();
+            int nextVersion=0;
+            void Schedule(IEnumerable<int> vertices)
+            {
+                var changed=new HashSet<(int a,int b)>();
+                foreach(int vertex in vertices)
+                    foreach(int index in incident[vertex])
+                    {
+                        var f=faces[index];
+                        for(int j=0;j<3;j++)
+                        {
+                            int a=f[j],b=f[(j+1)%3];
+                            if(a!=b) changed.Add(a<b?(a,b):(b,a));
+                        }
+                    }
+                foreach(var edge in changed)
+                {
+                    int version=++nextVersion;
+                    versions[edge]=version;
+                    edges.Push(new CutterEdge(edge,(points[edge.a]-points[edge.b]).sqrMagnitude,version));
+                }
+            }
+            Schedule(Enumerable.Range(0,points.Count));
+            Bounds original=source.bounds;
+            var anchors=new bool[points.Count];
+            for(int axis=0;axis<3;axis++)
+            {
+                int low=0,high=0;
+                for(int i=1;i<points.Count;i++)
+                { if(points[i][axis]<points[low][axis]) low=i;if(points[i][axis]>points[high][axis]) high=i; }
+                anchors[low]=anchors[high]=true;
+            }
+            int remaining=faces.Count;
+            // A quarter of the original faces is sufficient for a buried pit.
+            // Keep 12 faces for small solids and cap large operands at 64.
+            int target=Mathf.Clamp(Mathf.CeilToInt(faces.Count/8f)*2,12,64);
+            while(remaining>target&&edges.Count>0)
+            {
+                CutterEdge candidate=edges.Pop();
+                var edge=candidate.Edge;
+                if(!versions.TryGetValue(edge,out int current)||current!=candidate.Version) continue;
+                var adjacentA=new HashSet<int>(); var adjacentB=new HashSet<int>();
+                int shared=0;
+                foreach(int index in incident[edge.a])
+                {
+                    var f=faces[index];
+                    if(incident[edge.b].Contains(index)) shared++;
+                    for(int j=0;j<3;j++) adjacentA.Add(f[j]);
+                }
+                foreach(int index in incident[edge.b])
+                    for(int j=0;j<3;j++) adjacentB.Add(faces[index][j]);
+                adjacentA.Remove(edge.a); adjacentA.Remove(edge.b);
+                adjacentB.Remove(edge.a); adjacentB.Remove(edge.b); adjacentA.IntersectWith(adjacentB);
+                if(shared!=2||adjacentA.Count!=2) continue;
+                Vector3 midpoint=(points[edge.a]+points[edge.b])*0.5f;
+                bool anchorA=anchors[edge.a],anchorB=anchors[edge.b];
+                if(anchorA&&anchorB) continue;
+                if(anchorA) midpoint=points[edge.a];
+                else if(anchorB) midpoint=points[edge.b];
+                var touched=new HashSet<int>(incident[edge.a]); touched.UnionWith(incident[edge.b]);
+                bool valid=true;
+                foreach(int index in touched)
+                {
+                    if(incident[edge.a].Contains(index)&&incident[edge.b].Contains(index)) continue;
+                    var f=faces[index];
+                    Vector3 p=f.x==edge.a||f.x==edge.b?midpoint:points[f.x];
+                    Vector3 q=f.y==edge.a||f.y==edge.b?midpoint:points[f.y];
+                    Vector3 r=f.z==edge.a||f.z==edge.b?midpoint:points[f.z];
+                    Vector3 oldNormal=Vector3.Cross(points[f.y]-points[f.x],points[f.z]-points[f.x]);
+                    Vector3 newNormal=Vector3.Cross(q-p,r-p);
+                    if(newNormal.sqrMagnitude<1e-20f||Vector3.Dot(oldNormal,newNormal)<=0f) { valid=false; break; }
+                }
+                if(!valid) continue;
+                var changedVertices=new HashSet<int>();
+                foreach(int index in touched)
+                {
+                    var f=faces[index];
+                    for(int j=0;j<3;j++) { incident[f[j]].Remove(index);changedVertices.Add(f[j]); }
+                    for(int j=0;j<3;j++) if(f[j]==edge.b) f[j]=edge.a;
+                    if(f.x==f.y||f.y==f.z||f.z==f.x) { active[index]=false;remaining--; }
+                    else
+                    {
+                        faces[index]=f;
+                        for(int j=0;j<3;j++) incident[f[j]].Add(index);
+                    }
+                }
+                points[edge.a]=midpoint;
+                anchors[edge.a]=anchorA||anchorB;anchors[edge.b]=false;
+                // Only edges around the changed faces need a new priority or
+                // topology check. Old heap entries are discarded by version.
+                Schedule(changedVertices);
+            }
+            var mesh=new Mesh{name="Simple stone pit cutter"};
+            var output=new List<int>(remaining*3);
+            var compact=new List<Vector3>();var compactIds=new Dictionary<int,int>();
+            int Compact(int vertex)
+            {
+                if(!compactIds.TryGetValue(vertex,out int index))
+                { index=compact.Count;compactIds.Add(vertex,index);compact.Add(points[vertex]); }
+                return index;
+            }
+            for(int i=0;i<faces.Count;i++) if(active[i])
+            { output.Add(Compact(faces[i].x));output.Add(Compact(faces[i].y));output.Add(Compact(faces[i].z)); }
+            if(compact.Count==0) return mesh;
+            // Extremal vertices were anchored during collapse, preserving the
+            // footprint and depth without stretching the remaining facets.
+            mesh.SetVertices(compact); mesh.SetTriangles(output,0);
             mesh.RecalculateBounds();
             return mesh;
         }
 
-        private sealed class Tile
+        private readonly struct CutterEdge
         {
-            public Vector3 Origin;
+            public readonly (int a,int b) Edge;
+            public readonly float Length;
+            public readonly int Version;
+            public CutterEdge((int a,int b) edge,float length,int version)
+            { Edge=edge;Length=length;Version=version; }
+        }
+
+        private sealed class CutterEdgeHeap
+        {
+            private readonly List<CutterEdge> entries=new();
+            public int Count=>entries.Count;
+            private static bool Before(CutterEdge a,CutterEdge b) =>
+                a.Length<b.Length||a.Length==b.Length&&a.Version<b.Version;
+            public void Push(CutterEdge entry)
+            {
+                int index=entries.Count;
+                entries.Add(entry);
+                while(index>0)
+                {
+                    int parent=(index-1)/2;
+                    if(!Before(entry,entries[parent])) break;
+                    entries[index]=entries[parent];index=parent;
+                }
+                entries[index]=entry;
+            }
+            public CutterEdge Pop()
+            {
+                CutterEdge result=entries[0],last=entries[entries.Count-1];
+                entries.RemoveAt(entries.Count-1);
+                if(entries.Count==0) return result;
+                int index=0;
+                while(index*2+1<entries.Count)
+                {
+                    int child=index*2+1;
+                    if(child+1<entries.Count&&Before(entries[child+1],entries[child])) child++;
+                    if(!Before(entries[child],last)) break;
+                    entries[index]=entries[child];index=child;
+                }
+                entries[index]=last;
+                return result;
+            }
+        }
+
+        private sealed class Surface
+        {
             public Bounds Bounds;
             public List<Face> Original;
             public readonly List<Cut> Cuts=new();
+            public readonly Dictionary<Vector2Int,List<Face>> OriginalCells=new();
+            public readonly Dictionary<Vector2Int,List<Cut>> CutCells=new();
+            public readonly HashSet<Face> AffectedFaces=new();
             public Mesh Mesh;
-            public MeshCollider Collider;
-            public RenderBatch Rendering;
-        }
-
-        private sealed class RenderBatch
-        {
-            public Vector3 Origin;
-            public readonly List<Tile> Tiles=new();
+            public Mesh OriginalMesh;
+            public bool OwnsOriginalMesh;
+            public Mesh DrawMesh;
+            public bool OwnsMesh;
             public MeshFilter Filter;
-            public Mesh Mesh;
+            public MeshCollider Collider;
         }
-
-        private void FlushRenderBatches()
-        {
-            foreach(var batch in dirtyRenderBatches)
-            {
-                var combine=new CombineInstance[batch.Tiles.Count];
-                for(int i=0;i<combine.Length;i++)
-                    combine[i]=new CombineInstance{mesh=batch.Tiles[i].Mesh,
-                        transform=Matrix4x4.Translate(batch.Tiles[i].Origin-batch.Origin)};
-                var mesh=new Mesh{name="Batched terrain surface",indexFormat=IndexFormat.UInt32};
-                mesh.CombineMeshes(combine,true,true);
-                batch.Filter.sharedMesh=mesh;
-                if(batch.Mesh!=null) DestroyMesh(batch.Mesh);
-                batch.Mesh=mesh;
-            }
-            dirtyRenderBatches.Clear();
-        }
-
         private sealed class Cut
         {
-            public List<Face> Faces;
+            public Vector3[] Points;
+            public int[] Triangles;
             public Bounds Bounds;
+            private List<Face> faces;
+            public List<Face> Faces
+            {
+                get
+                {
+                    if(faces!=null) return faces;
+                    faces=new List<Face>(Triangles.Length/3);
+                    for(int i=0;i<Triangles.Length;i+=3)
+                    {
+                        Face face=new(new[]{Points[Triangles[i]],Points[Triangles[i+1]],Points[Triangles[i+2]]},true,true);
+                        if(face.Valid) faces.Add(face);
+                    }
+                    return faces;
+                }
+            }
+            public void ReleaseFaces()=>faces=null;
+        }
+
+        private static void ReleaseTemporaryFaces(Surface surface)
+        {
+            surface.Original=null;
+            surface.OriginalCells.Clear();
+            surface.AffectedFaces.Clear();
+            foreach(Cut cut in surface.Cuts) cut.ReleaseFaces();
         }
         private sealed class Region
         {
@@ -176,163 +462,190 @@ namespace Wyvernland
             public List<Cut> Cuts=new();
         }
 
-        // Split at tile boundaries without changing the original surface planes.
         public void AddSurface(Mesh source,Material material,string name,Action<MeshCollider> register)
         {
-            if(material!=null) material.SetFloat("_UseTerrainPitColor",1f);
-            var groups=new Dictionary<Vector2Int,List<Face>>();
-            Vector3[] vertices=source.vertices;
-            int[] indices=source.triangles;
-            for(int i=0;i<indices.Length;i+=3)
+            if(material!=null)
             {
-                var triangle=new Face(new[]{vertices[indices[i]],vertices[indices[i+1]],vertices[indices[i+2]]});
-                if(!triangle.Valid) continue;
-                Bounds bounds=triangle.Bounds;
-                int minX=Mathf.FloorToInt(bounds.min.x/TileSize),maxX=Mathf.FloorToInt(bounds.max.x/TileSize);
-                int minZ=Mathf.FloorToInt(bounds.min.z/TileSize),maxZ=Mathf.FloorToInt(bounds.max.z/TileSize);
-                for(int x=minX;x<=maxX;x++)
-                for(int z=minZ;z<=maxZ;z++)
-                {
-                    Face clipped=KeepBehind(triangle,Vector3.left,-x*TileSize);
-                    clipped=KeepBehind(clipped,Vector3.right,(x+1)*TileSize);
-                    clipped=KeepBehind(clipped,Vector3.back,-z*TileSize);
-                    clipped=KeepBehind(clipped,Vector3.forward,(z+1)*TileSize);
-                    if(clipped==null) continue;
-                    var key=new Vector2Int(x,z);
-                    if(!groups.TryGetValue(key,out var faces)) groups[key]=faces=new List<Face>();
-                    faces.Add(clipped);
-                }
+                material.SetFloat("_UseTerrainPitColor",1f);
+                material.SetFloat("_FlatTerrainNormal",1f);
             }
-            // Share a renderer across sixteen collision tiles. Collision and
-            // Boolean edits remain local; only the touched render batch is uploaded.
-            var batches=new Dictionary<Vector2Int,RenderBatch>();
-            foreach(var pair in groups)
-            {
-                Vector3 origin=new((pair.Key.x+0.5f)*TileSize,0f,(pair.Key.y+0.5f)*TileSize);
-                var faces=pair.Value.Select(f=>new Face(f.Vertices.Select(v=>v-origin))).ToList();
-                Mesh mesh=ToMesh(faces,name+" tile");
-                var go=new GameObject(name+" ["+pair.Key.x+","+pair.Key.y+"]");
-                go.transform.SetParent(root,false);
-                go.transform.localPosition=origin;
-                go.AddComponent<MeshFilter>().sharedMesh=mesh;
-                var collider=go.AddComponent<MeshCollider>();
+            GameObject go=new(name);
+            go.transform.SetParent(root,false);
+            // Adding a MeshCollider after a MeshFilter automatically cooks its
+            // current mesh. Configure first so the multi-million-face island is
+            // cooked once, using the intended source and midphase settings.
+            var collider=go.AddComponent<MeshCollider>();
+            var filter=go.AddComponent<MeshFilter>();
+            Mesh drawMesh=TerrainDrawMesh.Build(source);
+            filter.sharedMesh=drawMesh;
+            var renderer=go.AddComponent<MeshRenderer>();
+            renderer.sharedMaterial=material;
+            // PhysX's fast midphase has a documented triangle limit. The whole
+            // main island exceeds it, so use the compatible BVH for that mesh.
+            ulong triangles=0;
+            for(int slot=0;slot<source.subMeshCount;slot++) triangles+=source.GetIndexCount(slot)/3;
+            if(triangles>2097152)
                 collider.cookingOptions&=~MeshColliderCookingOptions.UseFastMidphase;
-                collider.sharedMesh=mesh;
-                var bounds=mesh.bounds; bounds.center+=origin;
-                var tile=new Tile{Origin=origin,Bounds=bounds,Original=faces,Mesh=mesh,Collider=collider};
-                var batchKey=new Vector2Int(Mathf.FloorToInt(pair.Key.x/4f),Mathf.FloorToInt(pair.Key.y/4f));
-                if(!batches.TryGetValue(batchKey,out var batch))
-                {
-                    var renderObject=new GameObject("Terrain render batch "+name+" "+batchKey);
-                    renderObject.transform.SetParent(root,false);
-                    var renderOrigin=new Vector3(batchKey.x*TileSize*4,0,batchKey.y*TileSize*4);
-                    renderObject.transform.localPosition=renderOrigin;
-                    batch=new RenderBatch{Origin=renderOrigin,Filter=renderObject.AddComponent<MeshFilter>()};
-                    renderObject.AddComponent<MeshRenderer>().sharedMaterial=material;
-                    batches.Add(batchKey,batch); renderBatches.Add(batch);
-                }
-                batch.Tiles.Add(tile); tile.Rendering=batch; dirtyRenderBatches.Add(batch);
-                tiles.Add(tile);
-                if(!columns.TryGetValue(pair.Key,out var column)) columns[pair.Key]=column=new List<Tile>();
-                column.Add(tile);
-                register(collider);
-                PhysicalDestructible.Ensure(go);
-            }
-            FlushRenderBatches();
+            collider.sharedMesh=source;
+            var surface=new Surface{Bounds=source.bounds,Mesh=source,OriginalMesh=source,DrawMesh=drawMesh,Filter=filter,Collider=collider};
+            surfaces.Add(surface);
+            Index(surfaceCells,surface.Bounds,surface,TerrainTiles.Size);
+            register(collider);
+            PhysicalDestructible.Ensure(go);
+            PlayerWorldLoading.NotifyChanged(go);
         }
 
-        // Height queries visit only the column under the ray, rather than every
-        // tile across all islands. Fall back for a tilted map or nonvertical ray.
+        public System.Collections.IEnumerator AddTiledSurfaceIncrementally(Mesh source,Material material,string name,Action<MeshCollider> register)
+        {
+            var split=TerrainTiles.Split(source,(mesh,cell)=>
+            {
+                AddSurface(mesh,material,$"{name} tile {cell.x},{cell.y}",register);
+                surfaces[surfaces.Count-1].OwnsOriginalMesh=true;
+            });
+            while(split.MoveNext()) yield return split.Current;
+        }
+
+        public void DrawSurfaces(CommandBuffer commands,Material material)
+        {
+            foreach(Surface surface in surfaces)
+                commands.DrawMesh(surface.Mesh,root.localToWorldMatrix,material);
+        }
+
         public bool Raycast(Ray ray,float distance,out RaycastHit hit)
         {
             hit=default;
-            float nearest=distance;
             bool found=false;
+            Vector3 start=root.InverseTransformPoint(ray.origin);
             Vector3 direction=root.InverseTransformVector(ray.direction);
-            if(Mathf.Abs(direction.x)>0.000001f||Mathf.Abs(direction.z)>0.000001f)
-            {
-                foreach(var tile in tiles) Visit(tile,ray,ref nearest,ref hit,ref found);
-                return found;
-            }
-            Vector3 point=root.InverseTransformPoint(ray.origin);
-            int minX=Mathf.FloorToInt((point.x-0.001f)/TileSize),maxX=Mathf.FloorToInt((point.x+0.001f)/TileSize);
-            int minZ=Mathf.FloorToInt((point.z-0.001f)/TileSize),maxZ=Mathf.FloorToInt((point.z+0.001f)/TileSize);
-            for(int x=minX;x<=maxX;x++)
-            for(int z=minZ;z<=maxZ;z++)
-                if(columns.TryGetValue(new Vector2Int(x,z),out var column))
-                    foreach(var tile in column) Visit(tile,ray,ref nearest,ref hit,ref found);
+            var bounds=new Bounds(start,Vector3.zero); bounds.Encapsulate(start+direction*distance);
+            foreach(Surface surface in Query(surfaceCells,bounds,TerrainTiles.Size))
+                if(surface.Collider.Raycast(ray,out var candidate,distance))
+                { hit=candidate; distance=candidate.distance; found=true; }
             return found;
-        }
-
-        private static void Visit(Tile tile,Ray ray,ref float nearest,ref RaycastHit hit,ref bool found)
-        {
-            if(!tile.Collider.Raycast(ray,out var candidate,nearest)) return;
-            hit=candidate; nearest=candidate.distance; found=true;
         }
 
         public void Subtract(Mesh stone,Matrix4x4 stoneToWorld)
         {
-            LastRebuiltTileCount=0;
+            LastRebuiltSurfaceCount=0;
             if(stone==null||!stone.isReadable) return;
             Matrix4x4 toMap=root.worldToLocalMatrix*stoneToWorld;
             Vector3[] points=stone.vertices.Select(toMap.MultiplyPoint3x4).ToArray();
             if(points.Length==0) return;
-            var bounds=new Bounds(points[0],Vector3.zero);
-            foreach(var p in points) bounds.Encapsulate(p);
             int[] indices=stone.triangles;
-            var candidates=new List<Tile>();
-            for(int x=Mathf.FloorToInt(bounds.min.x/TileSize);x<=Mathf.FloorToInt(bounds.max.x/TileSize);x++)
-            for(int z=Mathf.FloorToInt(bounds.min.z/TileSize);z<=Mathf.FloorToInt(bounds.max.z/TileSize);z++)
-                if(columns.TryGetValue(new Vector2Int(x,z),out var column)) candidates.AddRange(column);
-            foreach(Tile tile in candidates)
+            if(indices.Length<3) return;
+            Bounds bounds=new(points[indices[0]],Vector3.zero);
+            foreach(int index in indices) bounds.Encapsulate(points[index]);
+            bool valid=false;
+            bool mirrored=toMap.determinant<0f;
+            for(int i=0;i<indices.Length;i+=3)
             {
-                if(!tile.Bounds.Intersects(bounds)) continue;
-                var cut=new List<Face>();
-                bool mirrored=toMap.determinant<0f;
-                for(int i=0;i<indices.Length;i+=3)
-                {
-                    var face=new Face(new[]{points[indices[i]]-tile.Origin,
-                        points[indices[i+(mirrored?2:1)]]-tile.Origin,
-                        points[indices[i+(mirrored?1:2)]]-tile.Origin},true,true);
-                    if(face.Valid) cut.Add(face);
-                }
-                if(cut.Count==0) continue;
-                var localBounds=bounds; localBounds.center-=tile.Origin;
-                if(!tile.Original.Any(f=>f.Normal.y>0.001f&&f.Bounds.Intersects(localBounds))) continue;
-                tile.Cuts.Add(new Cut{Faces=cut,Bounds=localBounds});
-                if(batching) dirty.Add(tile);
-                else Rebuild(tile);
+                if(mirrored) (indices[i+1],indices[i+2])=(indices[i+2],indices[i+1]);
+                if(Vector3.Cross(points[indices[i+1]]-points[indices[i]],points[indices[i+2]]-points[indices[i]]).sqrMagnitude>=1e-20f)
+                    valid=true;
             }
-            if(!batching) FlushRenderBatches();
+            if(!valid) return;
+            // Preserve a compact cutter history. Polygon lists are expanded
+            // lazily for the active tile, then released after its rebuild.
+            var cutter=new Cut{Points=points,Triangles=indices,Bounds=bounds};
+            foreach(Surface surface in Query(surfaceCells,bounds,TerrainTiles.Size))
+            {
+                if(!surface.Bounds.Intersects(bounds)) continue;
+                if (batching)
+                {
+                    // Queue cutters without allocating this tile's original
+                    // faces. EndBatch processes and releases one tile at a time.
+                    surface.Cuts.Add(cutter);
+                    Index(surface.CutCells,bounds,cutter);
+                    dirty.Add(surface);
+                    continue;
+                }
+                if(surface.Original==null)
+                {
+                    var preparation=PrepareSurfaceIncrementally(surface);
+                    while(preparation.MoveNext()) { }
+                }
+                var touched=Query(surface.OriginalCells,bounds).Where(face=>face.Bounds.Intersects(bounds)).ToList();
+                if(touched.Count==0) { ReleaseTemporaryFaces(surface);continue; }
+                surface.Cuts.Add(cutter);
+                Index(surface.CutCells,bounds,cutter);
+                foreach(Face face in touched) surface.AffectedFaces.Add(face);
+                if(batching) dirty.Add(surface); else Rebuild(surface);
+            }
         }
 
-        private void Rebuild(Tile tile)
+        private void Rebuild(Surface surface)
         {
-                var rebuilt=new List<Face>();
-                foreach(var face in tile.Original)
+            var routine=RebuildIncrementally(surface);
+            while(routine.MoveNext()) { }
+            ReleaseTemporaryFaces(surface);
+        }
+
+        private System.Collections.IEnumerator RebuildIncrementally(Surface surface)
+        {
+            if (surface.Original==null)
+            {
+                var prepare=PrepareSurfaceIncrementally(surface);
+                while(prepare.MoveNext()) yield return prepare.Current;
+            }
+            if (surface.AffectedFaces.Count==0) yield break;
+            var rebuilt=new List<Face>();
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            foreach(Face face in surface.Original)
+            {
+                if(!surface.AffectedFaces.Contains(face)) rebuilt.Add(face);
+                else
                 {
-                    var relevant=tile.Cuts.Where(c=>c.Bounds.Intersects(face.Bounds)).ToList();
-                    if(face.Normal.y<=0.001f||relevant.Count==0) { rebuilt.Add(face); continue; }
-                    // Isolate each small footprint before Boolean clipping. Large
-                    // terrain triangles otherwise produce extremely thin slivers
-                    // and every unrelated stone fragments the same BSP tree.
-                    foreach(var region in Partition(face,relevant))
+                    var relevant=Query(surface.CutCells,face.Bounds).Where(cut=>cut.Bounds.Intersects(face.Bounds)).ToList();
+                    foreach(Region region in Partition(face,relevant))
                     {
-                        if(region.Cuts.Count==0) { rebuilt.Add(region.Face); continue; }
-                        float bottom=Mathf.Min(region.Face.Bounds.min.y,region.Cuts.Min(c=>c.Bounds.min.y))-1f;
-                        List<Face> solid=Prism(region.Face,bottom);
-                        foreach(var cutter in region.Cuts) solid=Difference(solid,cutter.Faces);
-                        rebuilt.AddRange(solid.Where(f=>f.Visible));
+                        if(region.Cuts.Count==0) rebuilt.Add(region.Face);
+                        else
+                        {
+                            float bottom=Mathf.Min(region.Face.Bounds.min.y,region.Cuts.Min(cut=>cut.Bounds.min.y))-1f;
+                            // Keep all Boolean operations for this region near
+                            // zero. Rounding intersections at kilometre-scale
+                            // coordinates creates slivers and oversized BSPs.
+                            Vector3 origin=region.Face.Vertices[0];
+                            List<Face> solid=Prism(region.Face.Translated(-origin),bottom-origin.y);
+                            Bounds regionBounds=region.Face.Bounds;
+                            regionBounds.SetMinMax(new Vector3(regionBounds.min.x,bottom,regionBounds.min.z),regionBounds.max);
+                            foreach(Cut cutter in region.Cuts)
+                            {
+                                // Group bounds can connect a whole pile. A cutter
+                                // outside this prism cannot change its geometry;
+                                // sending it through BSP still subdivides faces.
+                                if(!regionBounds.Intersects(cutter.Bounds)) continue;
+                                solid=Difference(solid,cutter.Faces.Select(part=>part.Translated(-origin)).ToList());
+                                // WebGL collects managed garbage between frames.
+                                // A pile can contain dozens of overlapping solids;
+                                // yield within that pile, not only after its region.
+                                if(WorldLoading.ShouldYield(ref batchStarted))
+                                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+                            }
+                            rebuilt.AddRange(solid.Where(part=>part.Visible).Select(part=>part.Translated(origin)));
+                        }
+                        if(WorldLoading.ShouldYield(ref batchStarted))
+                        { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
                     }
                 }
-                Mesh replacement=ToMesh(rebuilt,tile.Mesh.name);
-                tile.Collider.sharedMesh=null;
-                tile.Collider.GetComponent<MeshFilter>().sharedMesh=replacement;
-                tile.Collider.sharedMesh=replacement;
-                DestroyMesh(tile.Mesh);
-                tile.Mesh=replacement;
-                dirtyRenderBatches.Add(tile.Rendering);
-                LastRebuiltTileCount++;
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            Mesh replacement=ToMesh(rebuilt,surface.Mesh.name);
+            Mesh drawMesh=TerrainDrawMesh.Build(replacement);
+            ReplaceMeshes(surface,replacement,drawMesh);
+            LastRebuiltSurfaceCount++;
+        }
+
+        private static void ReplaceMeshes(Surface surface,Mesh collision,Mesh draw)
+        {
+            PlayerWorldLoading.BeforeChange(surface.Filter.gameObject);
+            Mesh old=surface.Mesh,oldDraw=surface.DrawMesh;
+            surface.Filter.sharedMesh=draw;surface.Collider.sharedMesh=collision;
+            if(oldDraw!=old) DestroyMesh(oldDraw);
+            if(surface.OwnsMesh) DestroyMesh(old);
+            surface.Mesh=collision;surface.DrawMesh=draw;surface.OwnsMesh=true;
+            PlayerWorldLoading.NotifyChanged(surface.Filter.gameObject);
         }
 
         private static List<Region> Partition(Face face,List<Cut> cuts)
@@ -455,9 +768,13 @@ namespace Wyvernland
 
         public void Dispose()
         {
-            foreach(var tile in tiles) DestroyMesh(tile.Mesh);
-            foreach(var batch in renderBatches) if(batch.Mesh!=null) DestroyMesh(batch.Mesh);
-            tiles.Clear(); columns.Clear(); renderBatches.Clear(); dirtyRenderBatches.Clear(); dirty.Clear();
+            foreach(Surface surface in surfaces)
+            {
+                if(surface.DrawMesh!=surface.Mesh) DestroyMesh(surface.DrawMesh);
+                if(surface.OwnsMesh) DestroyMesh(surface.Mesh);
+                if(surface.OwnsOriginalMesh) DestroyMesh(surface.OriginalMesh);
+            }
+            surfaces.Clear(); surfaceCells.Clear(); dirty.Clear();
         }
         private static void DestroyMesh(Mesh mesh)
         {
@@ -524,9 +841,16 @@ namespace Wyvernland
             }
             public List<Face> All()
             {
-                var result=new List<Face>(faces);
-                if(front!=null) result.AddRange(front.All());
-                if(back!=null) result.AddRange(back.All());
+                // Accumulate once. Recursive AddRange copied every descendant's
+                // polygons once per ancestor, which inflated temporary memory.
+                var result=new List<Face>();
+                var pending=new Stack<Node>(); pending.Push(this);
+                while(pending.Count>0)
+                {
+                    Node node=pending.Pop(); result.AddRange(node.faces);
+                    if(node.back!=null) pending.Push(node.back);
+                    if(node.front!=null) pending.Push(node.front);
+                }
                 return result;
             }
             public void Invert()
@@ -573,4 +897,5 @@ namespace Wyvernland
             }
         }
     }
+
 }

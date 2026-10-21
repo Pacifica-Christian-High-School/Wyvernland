@@ -49,8 +49,10 @@ namespace Wyvernland.Editor
             GeneratedGroundFeature[] monuments = groundFeatures.Where(feature =>
                 feature.name == "Ancient Lowland Monument").ToArray();
 
-            Require(islands.Select(c=>c.name.Split('[')[0].Trim()).Distinct().Count()==3,
-                "Expected solid terrain tiles from three floating islands.");
+            Require(islands.Length>=3&&islands.All(c=>c.enabled)&&
+                islands.Select(c=>c.name.Split(new[]{" tile "},System.StringSplitOptions.None)[0]).Distinct().Count()==3&&
+                islands.All(c=>c.sharedMesh.bounds.size.x<=100.001f&&c.sharedMesh.bounds.size.z<=100.001f),
+                "Expected three islands divided into permanently collidable 100m tiles.");
             Require(UnityEngine.Object.FindFirstObjectByType<Terrain>() == null, "Legacy square terrain still exists.");
             Require(player != null, "Player Rigidbody was not created.");
             Require(pauseMenu!=null,"Pause menu was not created.");
@@ -67,12 +69,12 @@ namespace Wyvernland.Editor
             Require(camera != null, "Player camera was not created.");
             Require(camera.transform.localPosition.y >= 1.6f, "Player camera is below the model's head position.");
             Require(map != null, "ProceduralMap component was not created.");
-            Require(volume != null && volume.profile.TryGet<DepthOfField>(out _), "Scene Depth volume effect was not created.");
+            Require(volume != null && volume.profile.TryGet<DepthOfField>(out _), "Depth of Field volume effect was not created.");
             Require(GroundFeatureLayout.Features.Any(feature => feature.Kind == GroundFeatureKind.StandingRock) &&
                 GroundFeatureLayout.Features.Any(feature => feature.Kind == GroundFeatureKind.EmbeddedRock) &&
                 GroundFeatureLayout.Features.Any(feature => feature.Kind == GroundFeatureKind.IndividualStone),
                 "Ground feature layout is missing a rock or stone type.");
-            Require(groundFeatures.Length > 0, "No nearby ground features were streamed.");
+            Require(groundFeatures.Length > 0, "No resident ground features were generated.");
             Require(monuments.Length == 5, "Expected exactly five ancient monuments.");
             Require(monuments.All(monument => ProceduralMap.IsOnMainIsland(
                 monument.transform.position.x,monument.transform.position.z)),
@@ -83,13 +85,12 @@ namespace Wyvernland.Editor
                 "Ground features must not have rigidbodies.");
             foreach (MeshCollider island in islands)
             {
-                Require(island.sharedMesh.bounds.min.y < -60f, "Island has no underside.");
                 Require(island.GetComponent<MeshRenderer>().sharedMaterial.shader.name == "Wyvernland/Unfired Clay", "Clay shader missing.");
-                Vector3[] normals = island.sharedMesh.normals;
-                for (int n = 0; n < normals.Length; n += 3)
-                    Require((normals[n] - normals[n+1]).sqrMagnitude < 0.0001f &&
-                        (normals[n] - normals[n+2]).sqrMagnitude < 0.0001f, "A triangle is not flat shaded.");
+                Require(island.GetComponent<MeshRenderer>().sharedMaterial.GetFloat("_FlatTerrainNormal")>.5f,
+                    "Terrain rendering must retain flat triangle shading.");
             }
+            foreach(var group in islands.GroupBy(c=>c.name.Split(new[]{" tile "},System.StringSplitOptions.None)[0]))
+                Require(group.Min(c=>c.sharedMesh.bounds.min.y)<-60f,"Island has no underside.");
             Require(float.IsNegativeInfinity(map.HeightAt(-2490f, -3240f)), "The void still has a floor.");
             Require(float.IsFinite(map.HeightAt(player.transform.position.x, player.transform.position.z)), "Spawn is outside the islands.");
 

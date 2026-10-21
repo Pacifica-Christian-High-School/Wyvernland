@@ -41,121 +41,55 @@ namespace Wyvernland
         public const int RockLargeShatterFragmentsPerImpact=22;
         public const int RockFullShatterFragmentsPerImpact=6;
         public const int WoodLargeShatterFragmentsPerImpact=9;
-        public const int MaximumFragmentsPerWindow=8;
-        public const int MaximumFragmentsPerFrame=2;
-        public const int MaximumPendingFragments=64;
-        public const int MaximumPendingFragmentVertices=120000;
-        public const int MaximumConvexFragmentTriangles=200;
-        public const float FragmentSpawnWindowSeconds=1f;
-        public const float MinimumQueuedFragmentFps=8f;
+        // Unity convex MeshColliders support at most 255 faces.
+        public const int MaximumConvexFragmentTriangles=255;
         public const float MinimumFragmentAxisSize=0f;
         public const float MinimumFragmentationVolume=0.002f;
         public const double MaximumCompleteDestructionVolume=1d;
+        public const double MaximumPartialShatterFragmentVolume=0.1d;
         public const double MinimumImpactorVolumeForFullTrunkDamage=0.06d;
-        public const float SimilarCollisionDestructionChance=0.4f;
+        public const float MaximumSimilarDestructionChance=0.3f;
+        public const float MinimumSimilarDestructionChance=0.01f;
+        public const float WoodFragmentImpulseScale=0.5f;
+        public const float WoodFragmentUpwardImpulseScale=0.25f;
+        public const float WoodFragmentMaximumUpwardSpeed=2.5f;
         public const float SimilarPropertyRange=2f;
-        public const float CollisionHardnessRetention=0.95f;
+        public const float CollisionHardnessRetention=0.97f;
         public static readonly PhysicalDestructEffect[] Effects={PhysicalDestructEffect.Fracture,
             PhysicalDestructEffect.Shatter,PhysicalDestructEffect.Depression,PhysicalDestructEffect.Slicing,PhysicalDestructEffect.Abrasion};
         public bool HasBeenDestroyed { get; private set; }
         public bool HasBeenModified { get; private set; }
         public PhysicalDestructEffect LastEffect { get; private set; }
         public static event Action<PhysicalDestructEffect> DestructionOccurred;
-        static readonly Queue<float> recentFragmentSpawns=new();
-        static readonly List<FragmentSpawnRequest> pendingFragments=new();
-        static float smoothedFrameTime;
-        static int pendingFragmentVertices,spawnFrame=-1,spawnsThisFrame;
         sealed class FragmentSpawnRequest
         {
             public Mesh Mesh;
             public Vector3 WorldCenter,LinearVelocity,AngularVelocity,Impulse;
+            public Quaternion WorldRotation=Quaternion.identity;
             public Material[] Materials;
             public MaterialPropertyBlock[] Appearance;
             public float Mass,Hardness,Resilience,MinimumImpactSpeed,
                 SimilarResilienceTolerance,FragmentImpulsePerSpeed,SizeGrowth;
             public double SolidVolume;
             public int FragmentationCount;
-            public bool Soft,TreePart,TrunkPart,BranchPart,TemporaryDebris;
+            public bool Soft,BranchPart,TemporaryDebris,BodyDebris;
             public string Name,MaterialName;
             public List<string> Labels;
-        }
-        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        static void ResetFragmentQueue()
-        {
-            ClearPendingFragments();
-            recentFragmentSpawns.Clear();
-            smoothedFrameTime=0f;
-            spawnFrame=-1;
-            spawnsThisFrame=0;
-        }
-        internal static void ClearPendingFragments()
-        {
-            foreach(var request in pendingFragments) Release(request.Mesh);
-            pendingFragments.Clear();
-            pendingFragmentVertices=0;
-        }
-        static FragmentSpawnRequest TakeLargestPending()
-        {
-            int largest=0;
-            for(int i=1;i<pendingFragments.Count;i++)
-                if(pendingFragments[i].SolidVolume>pendingFragments[largest].SolidVolume)
-                    largest=i;
-            var request=pendingFragments[largest];
-            pendingFragments.RemoveAt(largest);
-            pendingFragmentVertices-=request.Mesh.vertexCount;
-            return request;
-        }
-        static bool CanSpawnThisFrame()
-        {
-            if(spawnFrame!=Time.frameCount)
-            { spawnFrame=Time.frameCount; spawnsThisFrame=0; }
-            ExpireFragmentSpawns(Time.unscaledTime);
-            return spawnsThisFrame<MaximumFragmentsPerFrame&&
-                recentFragmentSpawns.Count<MaximumFragmentsPerWindow;
-        }
-        static void NoteFragmentSpawn()
-        {
-            spawnsThisFrame++;
-            recentFragmentSpawns.Enqueue(Time.unscaledTime);
-        }
-        static void QueueFragment(FragmentSpawnRequest request)
-        {
-            int vertices=request.Mesh.vertexCount;
-            if(pendingFragments.Count>=MaximumPendingFragments||
-                vertices>MaximumPendingFragmentVertices-pendingFragmentVertices)
-            { Release(request.Mesh); return; }
-            pendingFragments.Add(request);
-            pendingFragmentVertices+=vertices;
-        }
-        static void ExpireFragmentSpawns(float now)
-        {
-            while(recentFragmentSpawns.Count>0&&
-                now-recentFragmentSpawns.Peek()>=FragmentSpawnWindowSeconds)
-                recentFragmentSpawns.Dequeue();
-        }
-        internal static void DrainPendingFragments()
-        {
-            float dt=Time.unscaledDeltaTime;
-            if(dt>0f&&float.IsFinite(dt))
-                smoothedFrameTime=smoothedFrameTime<=0f?dt:
-                    Mathf.Lerp(smoothedFrameTime,dt,0.08f);
-            if(pendingFragments.Count==0||dt<=0f||
-                dt>=1f/MinimumQueuedFragmentFps||smoothedFrameTime<=0f||
-                1f/smoothedFrameTime<=MinimumQueuedFragmentFps) return;
-            if(!CanSpawnThisFrame()) return;
-            var request=TakeLargestPending();
-            if(request.TemporaryDebris&&!TemporaryShatterDebris.CanSpawn)
-            { Release(request.Mesh); return; }
-            SpawnPrepared(request,true);
-            NoteFragmentSpawn();
         }
         public event Action GeometryChanged;
         public event Action<PhysicalDestructible,IReadOnlyList<PhysicalDestructible>> Fragmented;
         public event Action<float> HardnessChanged;
         float nextImpact;
         float nextGeometryAttempt;
+        int failedGeometryAttempts;
+        Vector3 geometryAttemptLocalPoint;
+        bool GeometryAttemptReady(Vector3 point) => Time.time>=nextGeometryAttempt||
+            failedGeometryAttempts>0&&transform.TransformVector(
+                transform.InverseTransformPoint(point)-geometryAttemptLocalPoint).sqrMagnitude>0.01f;
         double lastCollisionStep=double.NegativeInfinity;
         readonly HashSet<int> attemptedCollisionPartners=new();
+        double lastHeldStrikeStep=double.NegativeInfinity;
+        readonly Dictionary<int,bool> heldStrikeOutcomes=new();
         readonly HashSet<PhysicalDestructible> collisionRecipients=new();
         Mesh ownedMesh;
         [SerializeField,Min(0)] int fragmentationCount;
@@ -196,11 +130,33 @@ namespace Wyvernland
             float otherHardness,float otherResilience) =>
             Mathf.Abs(otherHardness-hardness)<=SimilarPropertyRange&&
             Mathf.Abs(otherResilience-resilience)<=SimilarPropertyRange;
-        public static bool PassesSimilarityChance(float roll) =>
-            roll<SimilarCollisionDestructionChance;
+        public static float SimilarDestructionChance(float hardness,float resilience,
+            float otherHardness,float otherResilience)
+        {
+            if(hardness<7f||resilience<7f||otherHardness<7f||otherResilience<7f)
+                return MaximumSimilarDestructionChance;
+            float strength=(Mathf.Clamp(hardness,7,10)+Mathf.Clamp(resilience,7,10)+
+                Mathf.Clamp(otherHardness,7,10)+Mathf.Clamp(otherResilience,7,10)-28f)/12f;
+            return Mathf.Max(MinimumSimilarDestructionChance,
+                Mathf.Lerp(MaximumSimilarDestructionChance,MinimumSimilarDestructionChance,strength));
+        }
+        public static bool IsLowStrengthPair(float hardness,float resilience,
+            float otherHardness,float otherResilience) =>
+            hardness<4f&&resilience<4f&&otherHardness<4f&&otherResilience<4f;
+        public static float CollisionDestructionChance(float hardness,float resilience,
+            float otherHardness,float otherResilience,float size,float otherSize)
+        {
+            return Mathf.Abs(hardness-otherHardness)<=SimilarPropertyRange?
+                SimilarDestructionChance(hardness,resilience,otherHardness,otherResilience):1f;
+        }
         public static float CollisionWearChance(float resilience) => 0.8f/(1f+Mathf.Max(0f,resilience));
+        public static float MetalDestructionChanceScale(string material,float resilience) =>
+            WorldConfig.IsMetalMaterial(material)?Mathf.Clamp01((8f-resilience)/4f):1f;
+        public static float CollisionHardnessLossFraction(float resilience) =>
+            (1f-CollisionHardnessRetention)*Mathf.Pow(0.95f,Mathf.Max(0f,resilience-6f));
         public static float HardnessAfterCollision(float hardness,float resilience,float roll) =>
-            roll>=CollisionWearChance(resilience)?hardness:Mathf.Max(0f,hardness)*CollisionHardnessRetention;
+            roll>=CollisionWearChance(resilience)?hardness:
+                Mathf.Max(0f,hardness)*(1f-CollisionHardnessLossFraction(resilience));
         public static PhysicalDestructEffect Classify(float hardness,float resilience,bool soft,
             float otherHardness,float otherResilience,float tolerance=1f)
         {
@@ -222,7 +178,7 @@ namespace Wyvernland
         // objects cannot fracture each other or the destruction chance fails.
         public float InitialImpactSpeed(float otherHardness,string otherMaterialName=null)
         {
-            // Calibrated at the catalog midpoint for Stone (Hardness 5.5):
+            // Original calibration used Stone at Hardness 5.5:
             // Wood needs 14 m/s; Limestone needs 8 m/s. Greater hardness
             // advantage lowers the speed needed to start a fracture.
             float threshold=5.8f+1.4f*Resilience-(otherHardness-Hardness);
@@ -243,6 +199,17 @@ namespace Wyvernland
             if(outward.sqrMagnitude<0.000001f) outward=Vector3.up;
             return outward.normalized*(Mathf.Max(0f,relativeSpeed)*
                 Mathf.Max(0f,fragmentMass)*Mathf.Max(0f,impulsePerSpeed));
+        }
+        public static void LimitWoodFragmentFlight(ref Vector3 velocity,ref Vector3 impulse,float mass)
+        {
+            velocity.y=Mathf.Min(velocity.y,WoodFragmentMaximumUpwardSpeed);
+            impulse*=WoodFragmentImpulseScale;
+            if(impulse.y>0f)
+            {
+                impulse.y*=WoodFragmentUpwardImpulseScale;
+                impulse.y=Mathf.Min(impulse.y,
+                    Mathf.Max(0f,mass)*(WoodFragmentMaximumUpwardSpeed-velocity.y));
+            }
         }
         public void ApplyMaterial(string material)
         {
@@ -268,12 +235,13 @@ namespace Wyvernland
                     return;
                 }
             if(material=="Flesh") { Hardness=1f; Resilience=7f; }
-            if(material=="Clay"||material=="Mud"||material=="Soil"||material=="Resin")
+            if(material=="Clay"||material=="Mud"||material=="Soil"||
+                material=="Resin"||material=="Black Resin")
             { Hardness=0.5f; Resilience=8f; Soft=true; if(!Labels.Contains("Soft")) Labels.Add("Soft"); }
         }
         float StoneHardness()
         {
-            // A repeatable sample lets a streamed object retain its hardness when
+            // A repeatable sample gives an object consistent hardness when
             // generated again without advancing Unity's global random sequence.
             uint hash=StableMaterialHash();
             float first=Mix(hash^0x9e3779b9u)/4294967296f;
@@ -281,7 +249,7 @@ namespace Wyvernland
             bool rock=HasRockName();
             // Both kinds can span 4–7. Rocks usually draw from the lower half;
             // stones usually draw from the upper half.
-            return 4f+3f*(rock?Mathf.Min(first,second):Mathf.Max(first,second));
+            return 2f+3f*(rock?Mathf.Min(first,second):Mathf.Max(first,second));
         }
         bool HasRockName() =>
             gameObject.name.IndexOf("rock",StringComparison.OrdinalIgnoreCase)>=0&&
@@ -307,6 +275,9 @@ namespace Wyvernland
         }
         public static PhysicalDestructible Ensure(GameObject target)
         {
+            // Ropes own a chain of bodies and analytic material volume. A rigid
+            // mesh destruction target would replace that chain with a solid hull.
+            if(target.GetComponentInParent<RopeObject>(true)!=null) return null;
             if(IsPlayerObject(target)) return null;
             if(target.TryGetComponent<PhysicalDestructible>(out var existing))
             { existing.RefreshMassIfNeeded(); return existing; }
@@ -323,6 +294,8 @@ namespace Wyvernland
             { result.ApplyMaterial("Burnt Wood"); return result; }
             if(names.IndexOf("wood",StringComparison.OrdinalIgnoreCase)>=0||names.IndexOf("stump",StringComparison.OrdinalIgnoreCase)>=0)
             { result.ApplyMaterial("Wood"); return result; }
+            if(names.IndexOf("Black Resin",StringComparison.OrdinalIgnoreCase)>=0)
+            { result.ApplyMaterial("Black Resin"); return result; }
             foreach(string soft in new[]{"Clay","Mud","Soil","Resin","Soft"})
                 if(names.IndexOf(soft,StringComparison.OrdinalIgnoreCase)>=0)
                 { result.ApplyMaterial(soft=="Soft"?"Clay":soft); result.Soft=true; return result; }
@@ -355,6 +328,7 @@ namespace Wyvernland
                 Rigidbody massBody=GetComponent<Rigidbody>();
                 bool Owns(Transform source)
                 {
+                    if(source.GetComponentInParent<TreeImpactMarker>(true)!=null) return false;
                     var owner=source.GetComponentInParent<PhysicalDestructible>(true);
                     if(owner!=null&&owner.HasBeenDestroyed) return false;
                     return owner==this||massBody!=null&&source.GetComponentInParent<Rigidbody>(true)==massBody;
@@ -389,6 +363,9 @@ namespace Wyvernland
                     hasMaterialMass=MeshSolidVolume.TryMeasure(sources,out localMaterialVolume,out hasOpenMassSurfaces,0.00011f);
             }
             ApplyMeasuredMass();
+            if(GetComponent<DestructionFragment>()!=null||GetComponent<BodyFragment>()!=null||
+                GetComponent<TreeStructuralPart>() is { CanDrag:true }) FragmentMassCenter.Align(GetComponent<Rigidbody>());
+            GetComponent<TreeStructuralPart>()?.RefreshTrunkCenterOfMass();
         }
 
         void RefreshMassIfNeeded()
@@ -404,16 +381,22 @@ namespace Wyvernland
             solidVolumeCubicMetres=localMaterialVolume*measuredVolumeScale;
             massKg=MaterialDensity.TryGet(MaterialName,out float density)?(float)(solidVolumeCubicMetres*density):0f;
             measuredBody=GetComponent<Rigidbody>();
+            if(measuredBody!=null) MovingImpactMotion.Ensure(measuredBody);
             // Unity requires a positive Rigidbody mass. Zero-thickness render
             // surfaces retain zero material mass; only the physics solver uses
             // an epsilon if a Rigidbody is attached to one of those surfaces.
             if(hasMaterialMass&&measuredBody!=null&&float.IsFinite(massKg)) measuredBody.mass=Mathf.Max(0.0000001f,massKg);
         }
 
-        void Start() => RefreshMassIfNeeded();
+        void Start()
+        {
+            RefreshMassIfNeeded();
+            DynamicObjectSurfaceGuard.Ensure(GetComponent<Rigidbody>());
+        }
         public static PhysicalDestructible Resolve(Collider collider)
         {
             if(collider==null||collider.isTrigger) return null;
+            if(collider.GetComponentInParent<RopeObject>()!=null) return null;
             if(IsPlayerObject(collider.gameObject)) return null;
             var existing=collider.GetComponentInParent<PhysicalDestructible>();
             // A tree section can be parented under a moving section's body.
@@ -423,20 +406,57 @@ namespace Wyvernland
             return existing!=null?existing:Ensure(collider.gameObject);
         }
         bool Owns(Component component) =>
-            component!=null&&component.GetComponentInParent<PhysicalDestructible>(true)==this;
+            component!=null&&component.GetComponentInParent<TreeImpactMarker>(true)==null&&
+            component.GetComponentInParent<PhysicalDestructible>(true)==this;
         static bool IsPlayerObject(GameObject target)
         {
             if(target==null) return false;
+            if(target.GetComponentInParent<PlayerCorpse>()!=null) return true;
             // A held item is parented to the player's hand, but remains its own
             // physical object and collision damage source.
             foreach(var item in target.GetComponentsInParent<PickableObject>(true))
                 if(item.IsHeld) return false;
-            return target.GetComponentInParent<FirstPersonController>(true)!=null;
+            return target.GetComponentInParent<FirstPersonController>(true)!=null||target.GetComponentInParent<PlayerRagdoll>(true)!=null;
         }
         void OnCollisionEnter(Collision collision) => ProcessCollision(collision);
         void OnCollisionStay(Collision collision) => ProcessCollision(collision);
         internal void ProcessCollision(Collision collision)
         {
+            if(WebWorldSession.IsPhysicsHost&&WebWorldSession.CanSimulate(gameObject)&&collision.collider.GetComponentInParent<RemotePlayerDamage>() is {} victim) {
+                var heldSource=GetComponent<PickableObject>();
+                var sourceBody=GetComponentInParent<Rigidbody>();
+                var motion=sourceBody!=null?sourceBody.GetComponent<MovingImpactMotion>():null;
+                foreach(var contact in collision.contacts) {
+                    var tag=contact.otherCollider.GetComponent<PlayerHitShape>();
+                    Vector3 velocity=heldSource!=null&&heldSource.IsHeld?heldSource.HeldPointVelocity(contact.point):
+                        motion!=null?motion.PointVelocity(contact.point):sourceBody!=null?sourceBody.GetPointVelocity(contact.point):Vector3.zero;
+                    WebPlayerPresence.QueueImpact(victim,this,tag!=null?tag.Part:PlayerBodyPart.Torso,tag!=null?tag.transform.parent:null,contact.point,-contact.normal,velocity);
+                }
+            }
+            if(collision.contactCount>0) {
+                var otherSpark=collision.collider.GetComponentInParent<PhysicalDestructible>();
+                if(otherSpark!=null) { var contact=collision.GetContact(0);CollisionSparks.TryEmit(this,otherSpark,contact.point,contact.normal,RelativeCollisionSpeed(collision,otherSpark,contact.point)); }
+            }
+            if(!WebWorldSession.CanSimulate(gameObject)) return;
+            TreeStructuralPart.ProcessTerrainContact(collision);
+            // A held strike tries the normal material destruction rules first.
+            // A non-destructive held strike can rebound from harder solids
+            // above the measured object-speed threshold. Terrain ends it normally.
+            PickableObject ourHeld=GetComponentInParent<PickableObject>();
+            PickableObject theirHeld=collision.collider!=null?
+                collision.collider.GetComponentInParent<PickableObject>():null;
+            Vector3 contactPoint=collision.contactCount>0?
+                collision.GetContact(0).point:transform.position;
+            Rigidbody ourBody=GetComponentInParent<Rigidbody>();
+            Rigidbody theirBody=collision.collider!=null?
+                collision.collider.attachedRigidbody:null;
+            Collider ourCollider=collision.contactCount>0?
+                collision.GetContact(0).thisCollider:GetComponent<Collider>();
+            if(ourHeld!=null&&ourHeld.TryResolveStrikeImpact(collision.collider,contactPoint,
+                    theirBody!=null?theirBody.GetPointVelocity(contactPoint):Vector3.zero)||
+                theirHeld!=null&&theirHeld.TryResolveStrikeImpact(ourCollider,contactPoint,
+                    ourBody!=null?ourBody.GetPointVelocity(contactPoint):Vector3.zero))
+                return;
             // Most resting contacts are below both solids' minimum damage
             // speed. Skip them before resolving materials or enumerating the
             // contact manifold. Held items and fragments use special rules.
@@ -480,7 +500,8 @@ namespace Wyvernland
                 other.GetComponent<DestructionFragment>()==null&&
                 collisionSpeed<InitialImpactSpeed(other.Hardness,other.MaterialName)&&
                 collisionSpeed<other.InitialImpactSpeed(Hardness,MaterialName)) return;
-            if(TrySpecialFragmentCollision(other,contact.point,contact.normal,
+            bool similarHard=IsSimilarHardStrike(other);
+            if(!similarHard&&TrySpecialFragmentCollision(other,contact.point,contact.normal,
                 collisionSpeed)) return;
             if(other==null)
             {
@@ -507,16 +528,21 @@ namespace Wyvernland
             if(theirCollision&&theirWear) other.ApplyCollisionWear();
             if(collision.contactCount==0) return;
             if(!ourCollision&&!theirCollision) return;
-            var ourEffect=Classify(ourHardness,ourResilience,IsSoft,
+            // One shared roll for both recipients; two independent 1% rolls
+            // would almost double the maximum-strength collision probability.
+            if(similarHard&&UnityEngine.Random.value>=SimilarDestructionChance(
+                ourHardness,ourResilience,theirHardness,theirResilience)) return;
+            if(similarHard&&TrySpecialFragmentCollision(other,contact.point,contact.normal,speed)) return;
+            var ourEffect=similarHard?PhysicalDestructEffect.Fracture:Classify(ourHardness,ourResilience,IsSoft,
                 theirHardness,theirResilience,SimilarResilienceTolerance);
-            var theirEffect=Classify(theirHardness,theirResilience,other.IsSoft,
+            var theirEffect=similarHard?PhysicalDestructEffect.Fracture:Classify(theirHardness,theirResilience,other.IsSoft,
                 ourHardness,ourResilience,other.SimilarResilienceTolerance);
             bool tryOurs=ourCollision&&!HasBeenDestroyed&&Time.time>=nextImpact&&
-                Time.time>=nextGeometryAttempt&&
+                GeometryAttemptReady(contact.point)&&
                 (ourEffect==PhysicalDestructEffect.Fracture||ourEffect==PhysicalDestructEffect.Shatter)&&
                 speed>=InitialImpactSpeed(theirHardness,other.MaterialName);
             bool tryTheirs=theirCollision&&!other.HasBeenDestroyed&&Time.time>=other.nextImpact&&
-                Time.time>=other.nextGeometryAttempt&&
+                other.GeometryAttemptReady(contact.point)&&
                 (theirEffect==PhysicalDestructEffect.Fracture||theirEffect==PhysicalDestructEffect.Shatter)&&
                 speed>=other.InitialImpactSpeed(ourHardness,MaterialName);
             if(!tryOurs&&!tryTheirs) return;
@@ -529,10 +555,10 @@ namespace Wyvernland
             float theirMass=tryOurs?other.ImpactMassKg():0f;
             if(tryOurs)
                 ApplyImpact(theirHardness,theirResilience,theirSize,
-                    contact.point,contact.normal,speed,other.MaterialName,theirVolume,other.IsTerrain,theirMass);
+                    contact.point,contact.normal,speed,other.MaterialName,theirVolume,other.IsTerrain,theirMass,similarHeldStrike:similarHard);
             if(tryTheirs&&other!=null)
                 other.ApplyImpact(ourHardness,ourResilience,ourSize,
-                    contact.point,-contact.normal,speed,MaterialName,ourVolume,IsTerrain,ourMass);
+                    contact.point,-contact.normal,speed,MaterialName,ourVolume,IsTerrain,ourMass,similarHeldStrike:similarHard);
         }
         float ImpactMassKg()
         {
@@ -558,8 +584,10 @@ namespace Wyvernland
             if(GetComponent<TemporaryShatterDebris>()!=null||
                 other!=null&&other.GetComponent<TemporaryShatterDebris>()!=null)
                 return true;
-            bool ours=ourFragment&&SolidVolumeCubicMetres<MinimumFragmentationVolume;
-            bool theirs=theirFragment&&other.SolidVolumeCubicMetres<MinimumFragmentationVolume;
+            bool ours=ourFragment&&SolidVolumeCubicMetres<MinimumFragmentationVolume&&
+                HasElongatedGeometry();
+            bool theirs=theirFragment&&other.SolidVolumeCubicMetres<MinimumFragmentationVolume&&
+                other.HasElongatedGeometry();
             if(!ours&&!theirs) return false;
             PhysicalDestructible smaller=ours&&theirs?
                 (SolidVolumeCubicMetres<=other.SolidVolumeCubicMetres?this:other):
@@ -570,13 +598,35 @@ namespace Wyvernland
                 (impactor==null||!smaller.CanShatterUndersizedBranch(
                     impactor.Hardness,impactor.Resilience,impactor.MaterialName,speed)))
                 return true;
+            float metalChance=MetalDestructionChanceScale(smaller.MaterialName,smaller.Resilience);
+            if(metalChance<1f&&UnityEngine.Random.value>=metalChance) return true;
             smaller.SpecialCompleteShatter(point,smaller==this?normal:-normal,speed);
             return true;
         }
 
         bool IsUndersizedBranchFragment =>
             GetComponent<DestructionFragment>() is { IsBranchFragment: true }&&
-            SolidVolumeCubicMetres<MinimumFragmentationVolume;
+            SolidVolumeCubicMetres<MinimumFragmentationVolume&&HasElongatedGeometry();
+
+        bool HasElongatedGeometry()
+        {
+            foreach(var filter in GetComponentsInChildren<MeshFilter>())
+            {
+                if(filter.sharedMesh==null||!Owns(filter)) continue;
+                if(IsElongatedMesh(filter.sharedMesh,filter.transform.localToWorldMatrix))
+                    return true;
+            }
+            return false;
+        }
+
+        static bool IsElongatedMesh(Mesh mesh,Matrix4x4 localToWorld)
+        {
+            if(mesh==null) return false;
+            Vector3 size=mesh.bounds.size;
+            size=Vector3.Scale(size,new Vector3(localToWorld.GetColumn(0).magnitude,
+                localToWorld.GetColumn(1).magnitude,localToWorld.GetColumn(2).magnitude));
+            return PickableObject.ChooseGrabMode(size)==PickableGrabMode.Stick;
+        }
 
         bool CanShatterUndersizedBranch(float otherHardness,float otherResilience,
             string otherMaterialName,float speed) =>
@@ -597,6 +647,88 @@ namespace Wyvernland
             float pointSpeed=(ourVelocity-theirVelocity).magnitude;
             return heldImpact?pointSpeed:Mathf.Max(pointSpeed,collision.relativeVelocity.magnitude);
         }
+        internal bool TryHeldStrikeDestruction(PhysicalDestructible target,
+            Vector3 point,Vector3 incoming) => ResolveHeldStrikeDestruction(target,point,incoming);
+
+        internal bool IsSimilarHardStrike(PhysicalDestructible target) =>
+            target!=null&&!IsSoft&&!target.IsSoft&&!IsTerrain&&!target.IsTerrain&&
+            Mathf.Abs(Hardness-target.Hardness)<=SimilarPropertyRange;
+
+        internal bool CanDestroySimilarHeldStrike(PhysicalDestructible target,float speed) =>
+            IsSimilarHardStrike(target)&&(speed>=InitialImpactSpeed(target.Hardness,target.MaterialName)||
+                speed>=target.InitialImpactSpeed(Hardness,MaterialName));
+
+        internal bool ResolveHeldStrikeDestruction(PhysicalDestructible target,
+            Vector3 point,Vector3 incoming,float similarityRoll=-1f)
+        {
+            if(target==null||target==this) return false;
+            CollisionSparks.TryEmit(this,target,point,-incoming,incoming.magnitude);
+            var localGrip=GetComponentInParent<PickableObject>();
+            if(localGrip!=null&&localGrip.IsHeld&&!WebWorldSession.HasConfirmedClaim(localGrip)) return false;
+            if(target.HasBeenDestroyed) return true;
+            double step=Time.fixedTimeAsDouble;
+            if(step!=lastHeldStrikeStep)
+            { heldStrikeOutcomes.Clear(); lastHeldStrikeStep=step; }
+            int partnerId=target.GetInstanceID();
+            if(heldStrikeOutcomes.TryGetValue(partnerId,out bool previousOutcome))
+                return previousOutcome;
+
+            // Resolve the held object's damage first. Snapshot both sides so
+            // the target still receives the original impact after a fracture.
+            float speed=incoming.magnitude;
+            float heldHardness=Hardness,heldResilience=Resilience;
+            string heldMaterial=MaterialName;
+            bool heldIsTerrain=IsTerrain;
+            float targetHardness=target.Hardness,targetResilience=target.Resilience;
+            string targetMaterial=target.MaterialName;
+            bool targetIsTerrain=target.IsTerrain;
+            bool similarHard=IsSimilarHardStrike(target);
+            bool tryTarget=speed>=(similarHard?target.InitialImpactSpeed(
+                heldHardness,heldMaterial):target.RequiredImpactSpeed(heldHardness,heldResilience,heldMaterial));
+            bool tryHeld=speed>=(similarHard?InitialImpactSpeed(targetHardness,targetMaterial):
+                RequiredImpactSpeed(targetHardness,targetResilience,targetMaterial));
+            if(similarHard&&(tryTarget||tryHeld)&&
+                !(similarityRoll>=0f&&similarityRoll<=1f)) similarityRoll=UnityEngine.Random.value;
+            // One decision for the contact, shared with the physics host. Do not
+            // compound two independent per-object rolls or reroll collider callbacks.
+            bool passed=!similarHard||(tryTarget||tryHeld)&&
+                similarityRoll<SimilarDestructionChance(heldHardness,heldResilience,targetHardness,targetResilience);
+            if(WebWorldSession.ForwardStrike(this,target,point,incoming,similarHard?similarityRoll:-1f))
+            { heldStrikeOutcomes[partnerId]=passed; return passed; }
+            RegisterCollision(partnerId);
+            target.RegisterCollision(GetInstanceID());
+            if(!passed)
+            { heldStrikeOutcomes[partnerId]=false; return false; }
+            Vector3 hitDirection=speed>0.0001f?incoming/speed:transform.forward;
+            if((GetComponent<DestructionFragment>()!=null||
+                target.GetComponent<DestructionFragment>()!=null)&&
+                (speed>=InitialImpactSpeed(targetHardness,targetMaterial)||
+                 speed>=target.InitialImpactSpeed(Hardness,MaterialName))&&
+                TrySpecialFragmentCollision(target,point,hitDirection,speed))
+            {
+                bool fragmentDestroyed=HasBeenDestroyed||target==null||target.HasBeenDestroyed;
+                heldStrikeOutcomes[partnerId]=fragmentDestroyed;
+                return fragmentDestroyed;
+            }
+            if(!tryTarget&&!tryHeld)
+            { heldStrikeOutcomes[partnerId]=false; return false; }
+            float heldSize=tryTarget?WorldSize():0f;
+            float targetSize=tryHeld?target.WorldSize():0f;
+            double heldVolume=tryTarget?ImpactSolidVolume():0d;
+            double targetVolume=tryHeld?target.ImpactSolidVolume():0d;
+            float heldMass=tryTarget?ImpactMassKg():0f;
+            float targetMass=tryHeld?target.ImpactMassKg():0f;
+            bool destroyedHeld=tryHeld&&!HasBeenDestroyed&&ApplyImpact(targetHardness,
+                targetResilience,targetSize,point,hitDirection,speed,targetMaterial,
+                targetVolume,targetIsTerrain,targetMass,similarHeldStrike:similarHard);
+            bool destroyedTarget=tryTarget&&target!=null&&!target.HasBeenDestroyed&&
+                target.ApplyImpact(heldHardness,heldResilience,heldSize,
+                    point,-hitDirection,speed,heldMaterial,heldVolume,heldIsTerrain,heldMass,
+                    similarHeldStrike:similarHard);
+            bool destroyed=destroyedTarget||destroyedHeld;
+            heldStrikeOutcomes[partnerId]=destroyed;
+            return destroyed;
+        }
         bool RegisterCollision(int partnerId)
         {
             double step=Time.fixedTimeAsDouble;
@@ -606,6 +738,7 @@ namespace Wyvernland
         }
         void ApplyCollisionWear()
         {
+            if(IsTerrain) return;
             float remaining=HardnessAfterCollision(Hardness,Resilience,UnityEngine.Random.value);
             if(remaining==Hardness) return;
             Hardness=remaining;
@@ -615,7 +748,7 @@ namespace Wyvernland
         {
             bool found=false; Bounds bounds=default;
             foreach(var renderer in GetComponentsInChildren<Renderer>())
-            { if(!renderer.enabled||!Owns(renderer)) continue; if(!found) { bounds=renderer.bounds; found=true; } else bounds.Encapsulate(renderer.bounds); }
+            { if(!renderer.enabled&&!ResidentPropRendering.IsCached(renderer)||!Owns(renderer)) continue; if(!found) { bounds=renderer.bounds; found=true; } else bounds.Encapsulate(renderer.bounds); }
             if(!found) foreach(var collider in GetComponentsInChildren<Collider>())
             { if(collider.isTrigger||!Owns(collider)) continue; if(!found) { bounds=collider.bounds; found=true; } else bounds.Encapsulate(collider.bounds); }
             return Mathf.Max(bounds.size.x,Mathf.Max(bounds.size.y,bounds.size.z));
@@ -631,7 +764,11 @@ namespace Wyvernland
             for(int attempt=0;attempt<24;attempt++)
             {
                 if(!DestructionMesh.Split(source,
-                    new Plane(UnityEngine.Random.onUnitSphere,source.bounds.center),
+                    new Plane(GetComponent<TreeStructuralPart>()!=null?
+                        Quaternion.AngleAxis((attempt%2==0?1f:-1f)*
+                            ((attempt+1)/2%6),Vector3.right)*
+                            (StickFractureNormal(source)??Vector3.up):
+                        UnityEngine.Random.onUnitSphere,source.bounds.center),
                     out first,out second))
                 {
                     if(first!=null) Release(first);
@@ -645,7 +782,7 @@ namespace Wyvernland
             if(first==null||second==null)
             {
                 // An unusually thin closed mesh may not admit a reliable cut.
-                // Two short-lived scaled copies still give it a visible burst.
+                // Two scaled copies still give it a visible burst.
                 var fallback=TemporaryFallbackMeshes(source);
                 first=fallback[0]; second=fallback[1];
                 usedFallback=true;
@@ -654,7 +791,7 @@ namespace Wyvernland
             var centers=new Vector3[2];
             bool prepared=true;
             for(int i=0;i<parts.Length;i++)
-                prepared&=PrepareFragmentMesh(parts[i],transform.localToWorldMatrix,out centers[i]);
+                prepared&=PrepareObjectFragmentMesh(parts[i],out centers[i]);
             if(!prepared)
             {
                 foreach(var part in parts) Release(part);
@@ -662,7 +799,7 @@ namespace Wyvernland
                 parts=TemporaryFallbackMeshes(source);
                 prepared=true;
                 for(int i=0;i<parts.Length;i++)
-                    prepared&=PrepareFragmentMesh(parts[i],transform.localToWorldMatrix,out centers[i]);
+                    prepared&=PrepareObjectFragmentMesh(parts[i],out centers[i]);
                 if(!prepared)
                 {
                     foreach(var part in parts) Release(part);
@@ -689,12 +826,12 @@ namespace Wyvernland
             HasBeenModified=true;
             HasBeenDestroyed=true;
             var spawned=new List<PhysicalDestructible>(requests.Count);
-            SpawnOrQueue(requests,spawned);
+            SpawnFragmentsKeepingHeld(requests,spawned,true);
             gameObject.SetActive(false);
-            Release(gameObject);
             Fragmented?.Invoke(this,spawned);
             GeometryChanged?.Invoke();
             DestructionOccurred?.Invoke(PhysicalDestructEffect.Shatter);
+            Release(gameObject);
         }
         static Mesh[] TemporaryFallbackMeshes(Mesh source)
         {
@@ -713,8 +850,10 @@ namespace Wyvernland
         }
         public bool ApplyImpact(float otherHardness,float otherResilience,float otherSize,
             Vector3 point,Vector3 normal,float speed,string otherMaterialName=null,double otherSolidVolume=0d,
-            bool groundImpact=false,float otherMassKg=0f,Vector3? treeSplitPoint=null)
+            bool groundImpact=false,float otherMassKg=0f,Vector3? treeSplitPoint=null,bool similarHeldStrike=false)
         {
+            PlayerWorldLoading.BeforeChange(gameObject);
+            if(!WebWorldSession.CanSimulate(gameObject)) return false;
             if(IsUndersizedBranchFragment)
             {
                 if(HasBeenDestroyed||!CanShatterUndersizedBranch(otherHardness,
@@ -723,11 +862,13 @@ namespace Wyvernland
                 return HasBeenDestroyed;
             }
             bool forcedTreeSplit=treeSplitPoint.HasValue;
-            GeneratedTree tree=forcedTreeSplit?null:GetComponentInParent<GeneratedTree>();
+            GeneratedTree tree=forcedTreeSplit?null:
+                GetComponent<TreeStructuralPart>()?.Tree??GetComponentInParent<GeneratedTree>();
             if(IsPlayerObject(gameObject)||HasBeenDestroyed||!forcedTreeSplit&&
-                (Time.time<nextImpact||Application.isPlaying&&Time.time<nextGeometryAttempt||
-                speed<RequiredImpactSpeed(otherHardness,otherResilience,otherMaterialName))) return false;
-            var effect=forcedTreeSplit?PhysicalDestructEffect.Fracture:
+                (Time.time<nextImpact||Application.isPlaying&&!GeometryAttemptReady(point)||
+                speed<(similarHeldStrike?InitialImpactSpeed(otherHardness,otherMaterialName):
+                    RequiredImpactSpeed(otherHardness,otherResilience,otherMaterialName)))) return false;
+            var effect=forcedTreeSplit||similarHeldStrike?PhysicalDestructEffect.Fracture:
                 Classify(Hardness,Resilience,IsSoft,otherHardness,otherResilience,SimilarResilienceTolerance);
             bool smallImpactorOnTrunk=!forcedTreeSplit&&!groundImpact&&
                 GetComponent<TreeStructuralPart>() is { IsTrunk: true }&&
@@ -742,15 +883,20 @@ namespace Wyvernland
             // A Fracture needs an impactor larger than half the target's
             // longest world-space dimension. A hardness lead above two turns
             // a size-blocked Fracture into Shatter instead.
+            float targetSize=WorldSize();
             if(!forcedTreeSplit&&effect==PhysicalDestructEffect.Fracture&&
-                WorldSize()>=2f*Mathf.Max(0f,otherSize))
+                targetSize>=2f*Mathf.Max(0f,otherSize))
             {
                 if(otherHardness-Hardness<=2f) { LastEffect=effect; return false; }
                 effect=PhysicalDestructEffect.Shatter;
             }
             LastEffect=effect;
-            if(!forcedTreeSplit&&AreSimilar(Hardness,Resilience,otherHardness,otherResilience)&&
-                !PassesSimilarityChance(UnityEngine.Random.value)) return false;
+            float destructionChance=forcedTreeSplit||similarHeldStrike?1f:
+                CollisionDestructionChance(Hardness,Resilience,otherHardness,otherResilience,
+                    targetSize,otherSize);
+            if(!forcedTreeSplit)
+                destructionChance*=MetalDestructionChanceScale(MaterialName,Resilience);
+            if(destructionChance<1f&&UnityEngine.Random.value>=destructionChance) return false;
             if(effect!=PhysicalDestructEffect.Fracture&&effect!=PhysicalDestructEffect.Shatter) return false;
             TreeStructuralPart structure=GetComponent<TreeStructuralPart>();
             if(!forcedTreeSplit&&structure!=null&&structure.IsAttachedBranch)
@@ -761,8 +907,25 @@ namespace Wyvernland
                 DestructionOccurred?.Invoke(effect);
                 return true;
             }
+            // Compact fragments below the gameplay volume floor cannot break.
+            // Their cached mass and mesh bounds answer this without copying,
+            // welding and validating the entire previously damaged solid.
+            if(!forcedTreeSplit&&(GetComponent<DestructionFragment>()!=null||GetComponent<BodyFragment>()!=null)&&
+                HasMaterialMass&&SolidVolumeCubicMetres<MinimumFragmentationVolume&&
+                !HasElongatedGeometry()) return false;
             // Failed cuts must not retry their full search every physics tick.
-            if(Application.isPlaying) nextGeometryAttempt=Time.time+0.15f;
+            // Assume failure until geometry is committed below; all early
+            // returns then share the same bounded backoff.
+            if(!forcedTreeSplit)
+            {
+                Vector3 localGeometryPoint=transform.InverseTransformPoint(point);
+                if(transform.TransformVector(localGeometryPoint-geometryAttemptLocalPoint).sqrMagnitude>0.01f)
+                    failedGeometryAttempts=0;
+                geometryAttemptLocalPoint=localGeometryPoint;
+                failedGeometryAttempts=Mathf.Min(failedGeometryAttempts+1,4);
+                if(Application.isPlaying)
+                    nextGeometryAttempt=Time.time+Mathf.Min(2f,0.25f*(1<<failedGeometryAttempts));
+            }
             using var validationScope=DestructionMesh.BeginValidationScope();
             Mesh source=Snapshot(out Material[] materials,out MaterialPropertyBlock[] appearance);
             if(source==null) return false;
@@ -774,8 +937,8 @@ namespace Wyvernland
             bool validSource=SeparateAndClose(source,sourceParts);
             if(!validSource)
             { foreach(var part in sourceParts) Release(part); return false; }
-            // Use mesh volume in world units, rather than the enclosing bounds:
-            // thin or irregular objects must not fragment just because their bounds are large.
+            // Use mesh volume in world units. A low-volume source is protected
+            // only when its object-relative shape is also compact.
             double worldVolume=0;
             foreach(var part in sourceParts) worldVolume+=Volume(part);
             double originalLocalVolume=worldVolume;
@@ -788,7 +951,8 @@ namespace Wyvernland
                     worldVolume=materialVolume*Math.Abs((double)transform.localToWorldMatrix.determinant);
             }
             bool preserveRemainder=worldVolume>MaximumCompleteDestructionVolume;
-            if(worldVolume<MinimumFragmentationVolume)
+            if(worldVolume<MinimumFragmentationVolume&&
+                !IsElongatedMesh(source,transform.localToWorldMatrix))
             { foreach(var part in sourceParts) Release(part); return false; }
             var pieces=new List<Mesh>(); Mesh remainder=null;
             bool separatedSource=sourceParts.Count>1;
@@ -798,9 +962,12 @@ namespace Wyvernland
                 string.Equals(MaterialName,"Burnt Wood",StringComparison.OrdinalIgnoreCase);
             bool rock=string.Equals(MaterialName,"Stone",StringComparison.OrdinalIgnoreCase)&&
                 HasRockName();
-            // Growth changes preferred chip sizing, never the minimum volume
-            // needed to damage an object or one of its inherited fragments.
+            // Growth changes preferred chip sizing, not the compact-shape gate.
             float sizeGrowth=FragmentSizeMultiplierForImpact(otherMassKg);
+            double localShatterVolumeLimit=effect==PhysicalDestructEffect.Shatter?
+                MaximumPartialShatterFragmentVolume/
+                    Math.Max(Math.Abs((double)transform.localToWorldMatrix.determinant),0.000000001d):
+                double.PositiveInfinity;
             int fragmentBudget=wood?WoodLargeShatterFragmentsPerImpact:
                 rock&&effect==PhysicalDestructEffect.Shatter?
                     RockLargeShatterFragmentsPerImpact:LargeShatterFragmentsPerImpact;
@@ -831,9 +998,9 @@ namespace Wyvernland
                 float minimumDepth=MinimumFragmentAxisSize*1.2f*fragmentSize/scale;
                 pieces=rock&&effect==PhysicalDestructEffect.Shatter?
                     RockPartialShatterChips(source,localPoint,radius,out remainder,
-                        faces,fragmentBudget,minimumDepth,Hardness):
+                        faces,fragmentBudget,minimumDepth,Hardness,localShatterVolumeLimit):
                     ChipWithinFragmentBudget(source,localPoint,radius,out remainder,
-                        faces,fragmentBudget,minimumDepth,Hardness);
+                        faces,fragmentBudget,minimumDepth,Hardness,0f,localShatterVolumeLimit);
                 // Prefer larger chips, but retry the original valid sizing if
                 // that preference cannot fit the remaining mesh.
                 if(sizeGrowth>1f&&!LocalChipsAreValid(pieces,remainder,transform.localToWorldMatrix))
@@ -845,10 +1012,12 @@ namespace Wyvernland
                     pieces=rock&&effect==PhysicalDestructEffect.Shatter?
                         RockPartialShatterChips(source,localPoint,baseRadius,out remainder,
                             baseFaces,fragmentBudget,
-                            MinimumFragmentAxisSize*1.2f*baseSize/scale,Hardness):
+                            MinimumFragmentAxisSize*1.2f*baseSize/scale,Hardness,
+                            localShatterVolumeLimit):
                         ChipWithinFragmentBudget(source,localPoint,baseRadius,out remainder,
                             baseFaces,fragmentBudget,
-                            MinimumFragmentAxisSize*1.2f*baseSize/scale,Hardness);
+                            MinimumFragmentAxisSize*1.2f*baseSize/scale,Hardness,0f,
+                            localShatterVolumeLimit);
                 }
                 // A failed local cut leaves volume-protected objects intact.
                 // Smaller objects can fall back to a complete split.
@@ -862,12 +1031,14 @@ namespace Wyvernland
                         // Repeated chips make a surface increasingly intricate. A
                         // clean split can still remove material while retaining the
                         // lower portion when the chip budget cannot be satisfied.
-                        bool split=TryFractureSplit(source,transform.localToWorldMatrix,
+                        bool split=TryFractureSplit(source,FragmentPreparationMatrix(),
                             false,out var first,out var second,out _,
-                            Vector3.Lerp(localPoint,source.bounds.center,0.5f));
+                            Vector3.Lerp(localPoint,source.bounds.center,0.5f),
+                            fixedNormal:structure!=null?StickFractureNormal(source):null);
                         if(!split)
-                            split=TryFractureSplit(source,transform.localToWorldMatrix,
-                                false,out first,out second,out _);
+                            split=TryFractureSplit(source,FragmentPreparationMatrix(),
+                                false,out first,out second,out _,
+                                fixedNormal:structure!=null?StickFractureNormal(source):null);
                         if(!split) { Release(source); return false; }
                         if(WorldMinY(first,transform.localToWorldMatrix)<=
                             WorldMinY(second,transform.localToWorldMatrix))
@@ -888,19 +1059,34 @@ namespace Wyvernland
                 Mesh a,b;
                 if(forcedTreeSplit)
                 {
-                    localNormal=transform.InverseTransformDirection(Vector3.up).normalized;
-                    split=DestructionMesh.Split(source,new Plane(localNormal,
-                        transform.InverseTransformPoint(treeSplitPoint.Value)),out a,out b);
-                    if(split&&(!ClosedAfterSeparation(a,transform.localToWorldMatrix)||
-                        !ClosedAfterSeparation(b,transform.localToWorldMatrix)))
-                    { Release(a); Release(b); a=b=null; split=false; }
+                    // Keep cuts across the piece's local Y axis. Retry shallow
+                    // angles around its local X, so fallen trunks retain their
+                    // own division frame instead of using a world-horizontal plane.
+                    Vector3[] normals={Vector3.up,
+                        Quaternion.AngleAxis(5f,Vector3.right)*Vector3.up,
+                        Quaternion.AngleAxis(-5f,Vector3.right)*Vector3.up};
+                    Vector3 cutPoint=transform.InverseTransformPoint(treeSplitPoint.Value);
+                    a=b=null;
+                    split=false;
+                    foreach(Vector3 planeNormal in normals)
+                    {
+                        localNormal=planeNormal;
+                        if(!DestructionMesh.Split(source,new Plane(localNormal,cutPoint),out a,out b))
+                        { if(a!=null) Release(a); if(b!=null) Release(b); a=b=null; continue; }
+                        if(ClosedAfterSeparation(a,FragmentPreparationMatrix())&&
+                            ClosedAfterSeparation(b,FragmentPreparationMatrix()))
+                        { split=true; break; }
+                        Release(a); Release(b); a=b=null;
+                    }
                 }
-                else split=TryFractureSplit(source,transform.localToWorldMatrix,
+                else split=TryFractureSplit(source,FragmentPreparationMatrix(),
                     effect==PhysicalDestructEffect.Fracture,
                     out a,out b,out localNormal,
                     effect==PhysicalDestructEffect.Shatter?
                         (Vector3?)ShatterDividingPoint(localPoint,source.bounds.center,
-                            Vector3.Distance(localPoint,source.bounds.center),Hardness):null);
+                            Vector3.Distance(localPoint,source.bounds.center),Hardness):null,
+                    fixedNormal:structure!=null||effect==PhysicalDestructEffect.Fracture?
+                        StickFractureNormal(source):null);
                 if(split)
                 {
                     pieces.Add(a); pieces.Add(b);
@@ -954,6 +1140,10 @@ namespace Wyvernland
                 pieces.Exists(piece=>!DestructionMesh.IsClosedConnected(piece))||
                 pieces.Exists(piece=>!WithinOriginalBounds(piece,originalMeshBounds))||
                 pieces.Exists(piece=>!FragmentHasMinimumSize(piece,transform.localToWorldMatrix))||
+                local&&effect==PhysicalDestructEffect.Shatter&&
+                    pieces.Exists(piece=>Volume(piece)*
+                        Math.Abs(transform.localToWorldMatrix.determinant)>
+                        MaximumPartialShatterFragmentVolume+0.0000001d)||
                 remainder!=null&&(!DestructionMesh.IsClosedConnected(remainder)||
                     !WithinOriginalBounds(remainder,originalMeshBounds)))
             {
@@ -975,7 +1165,7 @@ namespace Wyvernland
             for(int i=0;i<pieces.Count;i++)
             {
                 pieceMasses[i]=mass*Volume(pieces[i])/Mathf.Max(totalVolume,0.000001f);
-                prepared&=PrepareFragmentMesh(pieces[i],transform.localToWorldMatrix,out centers[i]);
+                prepared&=PrepareObjectFragmentMesh(pieces[i],out centers[i]);
             }
             // Transforming and welding can collapse thin geometry. Validate the
             // actual rendered meshes before emitting anything or changing the source.
@@ -986,6 +1176,8 @@ namespace Wyvernland
                 return false;
             }
             RecordFragmentation();
+            failedGeometryAttempts=0;
+            nextGeometryAttempt=Time.time+0.15f;
             nextImpact=Time.time+0.25f; HasBeenModified=true;
             var requests=new List<FragmentSpawnRequest>(pieces.Count);
             for(int i=0;i<pieces.Count;i++)
@@ -993,23 +1185,44 @@ namespace Wyvernland
                     inheritedBody,pieceMasses[i],sourceCenter,normal,speed,
                     local?LargeShatterImpulseMultiplier:1f));
             var spawned=new List<PhysicalDestructible>(pieces.Count);
-            SpawnOrQueue(requests,spawned);
+            tree?.DropNearbyResin(point);
             if(local&&remainder!=null)
             {
                 ReplaceGeometry(remainder,materials,appearance,body);
                 RefreshMass();
-                if(body!=null) { body.ResetCenterOfMass(); body.ResetInertiaTensor(); }
+                if(body!=null)
+                {
+                    FragmentMassCenter.Align(body);
+                    structure?.RefreshTrunkCenterOfMass();
+                }
             }
             else
             {
                 if(remainder!=null) Release(remainder);
                 HasBeenDestroyed=true;
-                gameObject.SetActive(false); Release(gameObject);
             }
+            SpawnFragmentsKeepingHeld(requests,spawned,HasBeenDestroyed);
+            if(HasBeenDestroyed) gameObject.SetActive(false);
             Fragmented?.Invoke(this,spawned);
+            if(forcedTreeSplit&&structure!=null&&structure.IsTrunk)
+            {
+                TreeStructuralPart upper=null;
+                float highest=float.NegativeInfinity;
+                foreach(var piece in spawned)
+                    if(piece!=null&&piece.GetComponent<TreeStructuralPart>() is { } part&&
+                        part.TryGetSolidBoundsInFrame(transform,out Bounds bounds)&&bounds.center.y>highest)
+                    { upper=part; highest=bounds.center.y; }
+                upper?.AddTrunkSplitSphere(treeSplitPoint.Value);
+            }
             GeometryChanged?.Invoke();
             DestructionOccurred?.Invoke(effect);
-            if(tree!=null) tree.RecordDestructiveImpact(point,structure!=null&&structure.IsTrunk);
+            if(tree!=null) tree.RecordDestructiveImpact(point,
+                structure!=null&&structure.IsTrunk);
+            // Support callbacks need the source's transform while reconnecting
+            // the remaining tree. Edit-mode deletion is immediate.
+            // Reaching the tree threshold can recursively split and remove this
+            // source during RecordDestructiveImpact (immediately in the editor).
+            if(this!=null&&HasBeenDestroyed) Release(gameObject);
             return true;
         }
         public static bool FragmentHasMinimumSize(Mesh mesh,Matrix4x4 localToWorld)
@@ -1085,23 +1298,23 @@ namespace Wyvernland
 
         static List<Mesh> RockPartialShatterChips(Mesh source,Vector3 point,float radius,
             out Mesh remainder,int facesPerChip,int fragmentBudget,float minimumDepth,
-            float hardness)
+            float hardness,double maximumVolume)
         {
             // Measure this hit's usual chip count first. A fixed maximum does
             // nothing for Rock hits that never reach the global cap.
             var original=ChipWithinFragmentBudget(source,point,radius,out remainder,
-                facesPerChip,fragmentBudget,minimumDepth,hardness);
+                facesPerChip,fragmentBudget,minimumDepth,hardness,0f,maximumVolume);
             if(original.Count<=2) return original;
             int target=Mathf.Max(2,Mathf.RoundToInt(original.Count*0.7f));
             int groupedFaces=Mathf.Max(facesPerChip+2,
                 Mathf.CeilToInt(facesPerChip/0.7f));
             var reduced=ChipWithinFragmentBudget(source,point,radius,out Mesh reducedRemainder,
-                groupedFaces,target,minimumDepth,hardness);
+                groupedFaces,target,minimumDepth,hardness,0f,maximumVolume);
             if(reduced.Count==0)
             {
                 // An irregular surface may need larger face groups.
                 reduced=ChipWithinFragmentBudget(source,point,radius,out reducedRemainder,
-                    groupedFaces+2,target,minimumDepth,hardness);
+                    groupedFaces+2,target,minimumDepth,hardness,0f,maximumVolume);
             }
             if(reduced.Count==0) return original;
             foreach(var chip in original) Release(chip);
@@ -1112,21 +1325,34 @@ namespace Wyvernland
 
         public static List<Mesh> ChipWithinFragmentBudget(Mesh source,Vector3 point,float radius,
             out Mesh remainder,int maxFacesPerChip,int maxFragments,float minimumDepth=0f,
-            float hardness=10f,float minimumVolume=0f)
+            float hardness=10f,float minimumVolume=0f,
+            double maximumVolume=double.PositiveInfinity)
         {
+            // A box proxy can report contacts outside the remaining mesh.
+            // Smaller retry radii cannot reach that material either.
+            if(source.bounds.SqrDistance(point)>radius*radius)
+            { remainder=null; return new List<Mesh>(); }
             using var validationScope=DestructionMesh.BeginValidationScope();
-            for(int attempt=0;attempt<10;attempt++)
+            int attempts=DestructionMesh.FaceCount(source)>=DestructionMesh.MaximumRefinedChipFaces/2?2:10;
+            for(int attempt=0;attempt<attempts;attempt++)
             {
                 var chips=DestructionMesh.Chip(source,point,radius,
                     Mathf.Min(Mathf.Max(radius*0.4f,minimumDepth),
                         source.bounds.extents.magnitude*0.3f)*ShatterOffsetMultiplier(hardness),
                     out remainder,maxFacesPerChip);
                 bool tooSmall=chips.Exists(chip=>Volume(chip)+0.0000001f<minimumVolume);
-                if(chips.Count>0&&chips.Count<=maxFragments&&!tooSmall&&
+                double largestChipVolume=0d;
+                foreach(var chip in chips)
+                    largestChipVolume=Math.Max(largestChipVolume,Volume(chip));
+                bool tooLarge=largestChipVolume>maximumVolume+0.0000001d;
+                if(chips.Count>0&&chips.Count<=maxFragments&&!tooSmall&&!tooLarge&&
                     chips.TrueForAll(DestructionMesh.IsClosedConnected)&&ClosedComponents(remainder)) return chips;
                 foreach(var chip in chips) Release(chip);
                 Release(remainder);
-                radius*=tooSmall?1.25f:0.8f;
+                radius*=tooLarge?
+                    Mathf.Clamp(Mathf.Pow((float)(maximumVolume/largestChipVolume),
+                        1f/3f)*0.9f,0.2f,0.8f):
+                    tooSmall?1.25f:0.8f;
             }
             remainder=null;
             return new List<Mesh>();
@@ -1143,10 +1369,25 @@ namespace Wyvernland
             }
             return closed;
         }
+        Vector3? StickFractureNormal(Mesh source)
+        {
+            var treePart=GetComponent<TreeStructuralPart>();
+            if(treePart!=null&&treePart.IsTrunk) return Vector3.up;
+            Matrix4x4 matrix=transform.localToWorldMatrix;
+            Vector3 size=Vector3.Scale(source.bounds.size,new Vector3(
+                matrix.GetColumn(0).magnitude,matrix.GetColumn(1).magnitude,
+                matrix.GetColumn(2).magnitude));
+            if(treePart==null&&PickableObject.ChooseGrabMode(size,MaterialName)!=PickableGrabMode.Stick)
+                return null;
+            // A plane normal to the long axis splits the stick across its
+            // shortest dimension instead of peeling it lengthwise.
+            return size.x>=size.y&&size.x>=size.z?Vector3.right:
+                size.y>=size.z?Vector3.up:Vector3.forward;
+        }
         static bool TryFractureSplit(Mesh source,Matrix4x4 localToWorld,
             bool requireSourceWidth,
             out Mesh first,out Mesh second,out Vector3 chosenNormal,Vector3? dividingPoint=null,
-            float minimumWorldVolume=0f)
+            float minimumWorldVolume=0f,Vector3? fixedNormal=null)
         {
             // A source narrower than two minimum-width pieces cannot fracture
             // into two physically usable solids, even with a diagonal plane.
@@ -1157,9 +1398,11 @@ namespace Wyvernland
                 sourceSize.y+0.00001f<2f*MinimumFragmentAxisSize||
                 sourceSize.z+0.00001f<2f*MinimumFragmentAxisSize))
             { first=second=null; chosenNormal=Vector3.zero; return false; }
-            for(int attempt=0;attempt<48;attempt++)
+            int attempts=fixedNormal.HasValue?1:
+                DestructionMesh.FaceCount(source)>=DestructionMesh.MaximumRefinedChipFaces/2?4:48;
+            for(int attempt=0;attempt<attempts;attempt++)
             {
-                Vector3 normal=UnityEngine.Random.onUnitSphere;
+                Vector3 normal=fixedNormal??UnityEngine.Random.onUnitSphere;
                 if(!DestructionMesh.Split(source,new Plane(normal,dividingPoint??source.bounds.center),
                     out first,out second))
                 {
@@ -1219,6 +1462,8 @@ namespace Wyvernland
         }
         Mesh Snapshot(out Material[] materials,out MaterialPropertyBlock[] appearance)
         {
+            PlayerWorldLoading.BeforeChange(gameObject);
+            ResidentPropRendering.Release(gameObject);
             var combines=new List<CombineInstance>(); var slots=new List<Material>();
             var blocks=new List<MaterialPropertyBlock>(); var baked=new List<Mesh>();
             foreach(var renderer in GetComponentsInChildren<Renderer>())
@@ -1235,7 +1480,8 @@ namespace Wyvernland
                     // property arrays aligned with the geometry it actually emits.
                     if(mesh.GetIndexCount(s)==0) continue;
                     combines.Add(new CombineInstance { mesh=mesh, subMeshIndex=s,
-                        transform=transform.worldToLocalMatrix*renderer.transform.localToWorldMatrix });
+                        transform=renderer.transform==transform?Matrix4x4.identity:
+                            transform.worldToLocalMatrix*renderer.transform.localToWorldMatrix });
                     slots.Add(mats.Length>0?mats[Mathf.Min(s,mats.Length-1)]:null);
                     var perSlot=new MaterialPropertyBlock();
                     if(renderer.HasPropertyBlock()) renderer.GetPropertyBlock(perSlot,s);
@@ -1252,6 +1498,8 @@ namespace Wyvernland
         internal void NotifyGeometryChanged()
         {
             HasBeenModified=true;
+            failedGeometryAttempts=0;
+            nextGeometryAttempt=0f;
             nextImpact=Time.time+0.25f;
             GeometryChanged?.Invoke();
         }
@@ -1273,6 +1521,18 @@ namespace Wyvernland
         void ReplaceGeometry(Mesh mesh,Material[] materials,MaterialPropertyBlock[] appearance,Rigidbody body)
         {
             HideGeometry();
+            // Each partial hit installs one new shell. Remove the superseded
+            // shells rather than accumulating disabled colliders and relays
+            // that every later collision/pickup/mass scan has to visit.
+            var fragment=GetComponent<DestructionFragment>();
+            foreach(var relay in GetComponentsInChildren<PhysicalDestructionCollisionRelay>(true))
+                if(relay.Owner==this)
+                {
+                    if(fragment!=null)
+                        foreach(var obsolete in relay.GetComponentsInChildren<Collider>(true))
+                            fragment.UntrackCollider(obsolete);
+                    Release(relay.gameObject);
+                }
             // Pickup collider preparation must not restore the original uncut shell.
             foreach(var filter in GetComponentsInChildren<MeshFilter>())
                 if(Owns(filter)) filter.sharedMesh=null;
@@ -1325,6 +1585,32 @@ namespace Wyvernland
             Release(copy);
             return valid;
         }
+        Matrix4x4 FragmentPreparationMatrix()
+        {
+            if(GetComponent<TreeStructuralPart>()==null) return transform.localToWorldMatrix;
+            float parentScale=1f;
+            bool uniformParents=true;
+            for(Transform parent=transform.parent;parent!=null;parent=parent.parent)
+            {
+                Vector3 scale=parent.localScale;
+                if(!Mathf.Approximately(scale.x,scale.y)||!Mathf.Approximately(scale.x,scale.z))
+                { uniformParents=false;break; }
+                parentScale*=scale.x;
+            }
+            if(uniformParents) return Matrix4x4.Scale(transform.localScale*parentScale);
+            // Bake scale and shear in the tree's frame without rotating the mesh
+            // to world space and back. Repeated cuts retain their local seams.
+            var frame=Matrix4x4.Rotate(Quaternion.Inverse(transform.rotation))*transform.localToWorldMatrix;
+            frame.SetColumn(3,new Vector4(0f,0f,0f,1f));
+            return frame;
+        }
+        bool PrepareObjectFragmentMesh(Mesh mesh,out Vector3 worldCenter)
+        {
+            bool valid=PrepareFragmentMesh(mesh,FragmentPreparationMatrix(),out worldCenter);
+            if(GetComponent<TreeStructuralPart>()!=null)
+                worldCenter=transform.position+transform.rotation*worldCenter;
+            return valid;
+        }
         FragmentSpawnRequest PrepareSpawn(Mesh mesh,Vector3 worldCenter,Material[] materials,
             MaterialPropertyBlock[] appearance,Rigidbody source,
             float mass,Vector3 sourceCenter,Vector3 collisionNormal,float relativeSpeed,
@@ -1333,15 +1619,14 @@ namespace Wyvernland
             var request=new FragmentSpawnRequest
             {
                 Mesh=mesh,WorldCenter=worldCenter,Materials=materials,Appearance=appearance,
+                WorldRotation=GetComponent<TreeStructuralPart>()!=null?transform.rotation:Quaternion.identity,
                 Mass=Mathf.Max(0.001f,mass),Name=name+" fragment",MaterialName=MaterialName,
                 SolidVolume=DestructionMesh.SolidVolume(mesh),
-                Hardness=Hardness,Resilience=Resilience,Soft=Soft,
+                Hardness=Hardness,Resilience=Resilience,Soft=Soft,BodyDebris=GetComponent<BodyFragment>()!=null,
                 Labels=new List<string>(Labels),MinimumImpactSpeed=MinimumImpactSpeed,
                 SimilarResilienceTolerance=SimilarResilienceTolerance,
                 FragmentImpulsePerSpeed=FragmentImpulsePerSpeed,
                 FragmentationCount=fragmentationCount,SizeGrowth=fragmentSizeGrowth,
-                TreePart=GetComponent<TreeStructuralPart>()!=null,
-                TrunkPart=GetComponent<TreeStructuralPart>()?.IsTrunk==true,
                 BranchPart=GetComponent<TreeStructuralPart>()?.IsBranch==true||
                     GetComponent<DestructionFragment>()?.IsBranchFragment==true
             };
@@ -1355,51 +1640,87 @@ namespace Wyvernland
             }
             request.Impulse=FragmentImpulse(sourceCenter,worldCenter,collisionNormal,
                 relativeSpeed,request.Mass,FragmentImpulsePerSpeed*impulseMultiplier);
+            if(string.Equals(MaterialName,"Wood",StringComparison.OrdinalIgnoreCase)||
+                string.Equals(MaterialName,"Burnt Wood",StringComparison.OrdinalIgnoreCase)||
+                request.BranchPart)
+                LimitWoodFragmentFlight(ref request.LinearVelocity,ref request.Impulse,request.Mass);
             return request;
         }
 
-        static void SpawnOrQueue(List<FragmentSpawnRequest> requests,
-            List<PhysicalDestructible> spawned)
+        void SpawnFragmentsKeepingHeld(List<FragmentSpawnRequest> requests,
+            List<PhysicalDestructible> spawned,bool sourceWillBeDestroyed)
         {
-            requests.Sort((a,b)=>b.SolidVolume.CompareTo(a.SolidVolume));
-            foreach(var request in requests)
+            var sourcePickup=GetComponent<PickableObject>();
+            if(WebWorldSession.TryGetHeldGrip(sourcePickup,out Transform hand,out Vector3 grip)&&requests.Count>0)
             {
-                if(!Application.isPlaying)
+                FragmentSpawnRequest closest=null;
+                // A partial break leaves a valid candidate on the source too.
+                float bestDistance=sourceWillBeDestroyed?float.PositiveInfinity:
+                    (sourcePickup.NearestMeshSurfacePoint(grip)-grip).sqrMagnitude;
+                foreach(var request in requests)
                 {
-                    spawned.Add(SpawnPrepared(request));
+                    float distance=FragmentDistanceSquared(request,grip);
+                    if(distance>=bestDistance) continue;
+                    bestDistance=distance;
+                    closest=request;
                 }
-                else if(request.TemporaryDebris)
+                if(closest!=null)
                 {
-                    // A delayed dust burst is no longer useful. Keep only debris
-                    // that fits the current spawn and live-object budgets.
-                    if(pendingFragments.Count==0&&TemporaryShatterDebris.CanSpawn&&
-                        CanSpawnThisFrame())
-                    {
-                        spawned.Add(SpawnPrepared(request));
-                        NoteFragmentSpawn();
-                    }
-                    else Release(request.Mesh);
+                    // The piece remaining in the hand needs a usable grip.
+                    requests.Remove(closest);
+                    closest.TemporaryDebris=false;
+                    closest.LinearVelocity=Vector3.zero;
+                    closest.AngularVelocity=Vector3.zero;
+                    closest.Impulse=Vector3.zero;
+                    PhysicalDestructible retained=SpawnPrepared(closest);
+                    spawned.Add(retained);
+                    PickableObject fragment=retained.GetComponent<PickableObject>();
+                    WebWorldSession.TransferFragmentGrip(sourcePickup,fragment,hand,grip);
                 }
-                else if(pendingFragments.Count==0&&CanSpawnThisFrame())
-                {
-                    spawned.Add(SpawnPrepared(request));
-                    NoteFragmentSpawn();
-                }
-                else QueueFragment(request);
             }
+            SpawnImmediately(requests,spawned);
         }
 
-        static Collider AddFragmentCollider(GameObject target,Mesh mesh,bool dynamic)
+        static float FragmentDistanceSquared(FragmentSpawnRequest request,Vector3 hand)
+        {
+            Vector3 localHand=Quaternion.Inverse(request.WorldRotation)*(hand-request.WorldCenter);
+            Vector3[] vertices=request.Mesh.vertices;
+            int[] triangles=request.Mesh.triangles;
+            float best=float.PositiveInfinity;
+            for(int i=0;i+2<triangles.Length;i+=3)
+            {
+                Vector3 point=PickableObject.ClosestTrianglePoint(localHand,
+                    vertices[triangles[i]],vertices[triangles[i+1]],
+                    vertices[triangles[i+2]]);
+                best=Mathf.Min(best,(point-localHand).sqrMagnitude);
+            }
+            if(!float.IsFinite(best))
+                best=(request.Mesh.bounds.ClosestPoint(localHand)-localHand).sqrMagnitude;
+            return best;
+        }
+
+        static void SpawnImmediately(List<FragmentSpawnRequest> requests,
+            List<PhysicalDestructible> spawned)
+        {
+            foreach(var request in requests) spawned.Add(SpawnPrepared(request));
+        }
+
+        internal static Collider AddFragmentCollider(GameObject target,Mesh mesh,bool dynamic)
         {
             int triangleCount=0;
             for(int slot=0;slot<mesh.subMeshCount;slot++)
                 triangleCount+=(int)mesh.GetIndexCount(slot)/3;
             if(dynamic&&triangleCount>MaximumConvexFragmentTriangles)
             {
-                var box=target.AddComponent<BoxCollider>();
-                box.center=mesh.bounds.center;
-                box.size=mesh.bounds.size;
-                return box;
+                // A bounds box can be far from an angular chip's actual surface.
+                // Cook a small convex hull from the source's outer faces instead.
+                Mesh proxy=FragmentColliderProxy(mesh);
+                if(proxy!=null) {
+                    var precise=target.AddComponent<MeshCollider>();
+                    precise.sharedMesh=proxy;precise.convex=true;
+                    target.AddComponent<RuntimeMeshOwner>().Initialize(proxy);
+                    return precise;
+                }
             }
             var collider=target.AddComponent<MeshCollider>();
             collider.sharedMesh=mesh;
@@ -1407,17 +1728,64 @@ namespace Wyvernland
             return collider;
         }
 
-        static PhysicalDestructible SpawnPrepared(FragmentSpawnRequest request,bool deferred=false)
+        static Mesh FragmentColliderProxy(Mesh source)
         {
+            Vector3[] vertices=source.vertices;
+            var faces=new List<(int a,int b,int c)>();
+            int[] vertexFace=new int[vertices.Length];Array.Fill(vertexFace,-1);
+            for(int slot=0;slot<source.subMeshCount;slot++) {
+                int[] triangles=source.GetTriangles(slot);
+                for(int t=0;t+2<triangles.Length;t+=3) {
+                    int face=faces.Count;faces.Add((triangles[t],triangles[t+1],triangles[t+2]));
+                    if(vertexFace[triangles[t]]<0) vertexFace[triangles[t]]=face;
+                    if(vertexFace[triangles[t+1]]<0) vertexFace[triangles[t+1]]=face;
+                    if(vertexFace[triangles[t+2]]<0) vertexFace[triangles[t+2]]=face;
+                }
+            }
+            var selected=new HashSet<int>();
+            void Support(Vector3 direction) {
+                int best=-1;float score=float.NegativeInfinity;
+                for(int i=0;i<vertices.Length;i++) if(vertexFace[i]>=0) {
+                    float dot=Vector3.Dot(vertices[i],direction);
+                    if(dot>score) { score=dot;best=i; }
+                }
+                if(best>=0) selected.Add(vertexFace[best]);
+            }
+            Support(Vector3.right);Support(Vector3.left);Support(Vector3.up);
+            Support(Vector3.down);Support(Vector3.forward);Support(Vector3.back);
+            for(int i=0;i<32;i++) {
+                float y=1f-2f*(i+.5f)/32f;
+                float radius=Mathf.Sqrt(Mathf.Max(0f,1f-y*y));
+                float angle=i*2.39996323f;
+                Support(new Vector3(Mathf.Cos(angle)*radius,y,Mathf.Sin(angle)*radius));
+            }
+            if(selected.Count<4) return null;
+            var points=new List<Vector3>(selected.Count*3);
+            var indices=new List<int>(selected.Count*3);
+            foreach(int face in selected) {
+                var entry=faces[face];int start=points.Count;
+                points.Add(vertices[entry.a]);points.Add(vertices[entry.b]);points.Add(vertices[entry.c]);
+                indices.Add(start);indices.Add(start+1);indices.Add(start+2);
+            }
+            var proxy=new Mesh { name="Fragment convex collision proxy" };
+            proxy.SetVertices(points);proxy.SetTriangles(indices,0);proxy.RecalculateBounds();
+            return proxy;
+        }
+
+        static PhysicalDestructible SpawnPrepared(FragmentSpawnRequest request)
+        {
+            if(request.BodyDebris) request.TemporaryDebris=false;
             var piece=new GameObject(request.Name);
-            piece.transform.position=request.WorldCenter;
+            piece.transform.SetPositionAndRotation(request.WorldCenter,request.WorldRotation);
             piece.AddComponent<MeshFilter>().sharedMesh=request.Mesh;
-            ApplyAppearance(piece.AddComponent<MeshRenderer>(),request.Materials,request.Appearance);
+            var appearanceMaterials=request.BodyDebris?
+                BodyFragment.OwnAppearance(piece,request.Materials,request.Mesh.subMeshCount):request.Materials;
+            ApplyAppearance(piece.AddComponent<MeshRenderer>(),appearanceMaterials,request.Appearance);
             AddFragmentCollider(piece,request.Mesh,true);
             var body=piece.AddComponent<Rigidbody>(); body.mass=request.Mass;
-            body.centerOfMass=Vector3.zero;
-            body.ResetInertiaTensor();
+            FragmentMassCenter.Align(body);
             body.collisionDetectionMode=CollisionDetectionMode.ContinuousDynamic;
+            DynamicObjectSurfaceGuard.Ensure(body);
             body.linearVelocity=request.LinearVelocity;
             body.angularVelocity=request.AngularVelocity;
             if(Application.isPlaying) body.AddForce(request.Impulse,ForceMode.Impulse);
@@ -1439,16 +1807,162 @@ namespace Wyvernland
             {
                 var pickup=piece.AddComponent<PickableObject>();
                 pickup.DisplayName=request.MaterialName+" fragment";
+                pickup.ForceRegularGrip=Array.Exists(WorldConfig.MineralMaterials,name=>string.Equals(name,request.MaterialName,StringComparison.OrdinalIgnoreCase))||request.MaterialName.IndexOf("stone",StringComparison.OrdinalIgnoreCase)>=0;
             }
             piece.AddComponent<DestructionFragment>().IsBranchFragment=request.BranchPart;
+            if(request.BodyDebris) { piece.AddComponent<BodyFragment>().WorldId="d"+Guid.NewGuid().ToString("N");
+                if(piece.GetComponent<PickableObject>() is {} bodyPickup) { bodyPickup.DisplayName="Body fragment";bodyPickup.ForceRegularGrip=true; } }
             if(request.TemporaryDebris) piece.AddComponent<TemporaryShatterDebris>();
-            if(deferred&&request.TreePart)
-                piece.AddComponent<TreeStructuralPart>().SetTrunk(request.TrunkPart);
+            if(properties.SolidVolumeCubicMetres<MinimumFragmentationVolume)
+                SmallFragmentRest.Ensure(piece);
+            PlayerWorldLoading.NotifyChanged(piece);
             return properties;
         }
         static void Release(UnityEngine.Object value) { if(Application.isPlaying) Destroy(value); else DestroyImmediate(value); }
-        void OnDestroy() { if(ownedMesh!=null) Release(ownedMesh); }
+        void OnDestroy() { WebWorldSession.Removed(gameObject); if(ownedMesh!=null) Release(ownedMesh); }
+
+        [Serializable] public sealed class NetworkProperties
+        {
+            public float hardness,resilience,minimumSpeed,tolerance,impulse,growth;
+            public int count,effect;
+            public string material;
+            public string[] labels;
+            public bool soft,modified,fragment,branchFragment;
+        }
+        internal NetworkProperties CaptureNetworkProperties() => new() {
+            hardness=Hardness,resilience=Resilience,minimumSpeed=MinimumImpactSpeed,
+            tolerance=SimilarResilienceTolerance,impulse=FragmentImpulsePerSpeed,
+            growth=fragmentSizeGrowth,count=fragmentationCount,effect=(int)LastEffect,
+            material=MaterialName,labels=Labels.ToArray(),soft=Soft,modified=HasBeenModified,
+            fragment=GetComponent<DestructionFragment>()!=null,
+            branchFragment=GetComponent<DestructionFragment>()?.IsBranchFragment??false,
+        };
+        internal void ApplyNetworkProperties(NetworkProperties value)
+        {
+            if(value==null) return;
+            Hardness=IsTerrain?Mathf.Max(Hardness,value.hardness):value.hardness;Resilience=value.resilience;MinimumImpactSpeed=value.minimumSpeed;
+            SimilarResilienceTolerance=value.tolerance;FragmentImpulsePerSpeed=value.impulse;
+            fragmentSizeGrowth=value.growth;fragmentationCount=value.count;LastEffect=(PhysicalDestructEffect)value.effect;
+            MaterialName=value.material;Soft=value.soft;HasBeenModified=value.modified;HasBeenDestroyed=false;
+            Labels=new List<string>(value.labels??Array.Empty<string>());
+            if(value.fragment) {
+                var fragment=GetComponent<DestructionFragment>()??gameObject.AddComponent<DestructionFragment>();
+                fragment.IsBranchFragment=value.branchFragment;
+            }
+            massInitialized=false;RefreshMass();
+        }
+        internal Mesh CaptureNetworkMesh(out Material[] materials) => Snapshot(out materials,out _);
+        internal void ApplyNetworkMesh(Mesh mesh,Material[] materials)
+        {
+            PlayerWorldLoading.BeforeChange(gameObject);
+            ReplaceGeometry(mesh,materials,new MaterialPropertyBlock[materials.Length],GetComponent<Rigidbody>());
+            massInitialized=false;RefreshMass();
+        }
+        internal void RefreshNetworkColliders()
+        {
+            bool dynamic=GetComponentInParent<Rigidbody>()!=null;
+            foreach(var collider in GetComponentsInChildren<MeshCollider>(true)) {
+                if(!Owns(collider)||collider.sharedMesh==null) continue;
+                if(!dynamic) { collider.convex=false;continue; }
+                int faces=0;var mesh=collider.sharedMesh;
+                for(int slot=0;slot<mesh.subMeshCount;slot++) faces+=(int)mesh.GetIndexCount(slot)/3;
+                if(faces<=MaximumConvexFragmentTriangles) collider.convex=true;
+                else {
+                    Mesh proxy=FragmentColliderProxy(mesh);
+                    if(proxy!=null) {
+                        collider.sharedMesh=proxy;collider.convex=true;
+                        collider.gameObject.AddComponent<RuntimeMeshOwner>().Initialize(proxy);
+                    }
+                }
+            }
+        }
     }
+
+    // Dynamic fragments and dropped objects can begin a physics step partly
+    // inside a static mesh. Resolve that overlap before the solver lets them
+    // settle below the visible surface.
+    public sealed class DynamicObjectSurfaceGuard : MonoBehaviour
+    {
+        private const float ContactTolerance=0.02f;
+        private const float SeparationSkin=0.005f;
+        private const float MaximumCorrectionPerStep=0.5f;
+        private readonly Collider[] nearby=new Collider[64];
+        private Rigidbody body;
+        private float nextCheck;
+
+        public static void Ensure(Rigidbody target)
+        {
+            if(target!=null) ResidentPropRendering.Release(target.gameObject);
+            if(target!=null&&target.GetComponent<DynamicObjectSurfaceGuard>()==null)
+            {
+                target.gameObject.AddComponent<DynamicObjectSurfaceGuard>();
+            }
+        }
+
+        private void Awake() => body=GetComponent<Rigidbody>();
+
+        private void FixedUpdate()
+        {
+            if(body==null||body.isKinematic||!body.detectCollisions||body.IsSleeping()||
+                Time.fixedTime<nextCheck) return;
+            nextCheck=Time.fixedTime+0.04f;
+            ResolveStaticOverlap();
+        }
+
+        public bool ResolveStaticOverlap()
+        {
+            if(body==null||body.isKinematic||!body.detectCollisions) return false;
+            Collider[] own=GetComponentsInChildren<Collider>();
+            Vector3 correction=Vector3.zero;
+            Vector3 separatingNormal=Vector3.zero;
+            float largestDepth=ContactTolerance;
+            foreach(Collider shape in own)
+            {
+                if(shape==null||!shape.enabled||shape.isTrigger||
+                    shape.attachedRigidbody!=body||
+                    shape is MeshCollider { convex:false }) continue;
+                Bounds bounds=shape.bounds;
+                if(bounds.extents.sqrMagnitude<0.000001f) continue;
+                int count=Physics.OverlapBoxNonAlloc(bounds.center,
+                    bounds.extents+Vector3.one*0.05f,nearby,Quaternion.identity,
+                    ~0,QueryTriggerInteraction.Ignore);
+                for(int i=0;i<count;i++)
+                {
+                    Collider surface=nearby[i];
+                    if(surface==null||surface==shape||!surface.enabled||
+                        surface.attachedRigidbody!=null||
+                        surface.transform.IsChildOf(transform)) continue;
+                    if(!Physics.ComputePenetration(shape,
+                        shape.transform.position,shape.transform.rotation,surface,
+                        surface.transform.position,surface.transform.rotation,
+                        out Vector3 direction,out float depth)) continue;
+                    if(direction.y< -0.25f&&
+                        surface.bounds.max.y>bounds.center.y&&
+                        surface.Raycast(new Ray(new Vector3(bounds.center.x,
+                            surface.bounds.max.y+0.5f,bounds.center.z),Vector3.down),
+                            out RaycastHit topHit,surface.bounds.size.y+1f))
+                    {
+                        float lift=topHit.point.y-bounds.min.y+SeparationSkin;
+                        if(lift>depth)
+                        { direction=Vector3.up; depth=lift; }
+                    }
+                    if(depth<=largestDepth) continue;
+                    largestDepth=depth;
+                    separatingNormal=direction;
+                    correction=direction*Mathf.Min(depth+SeparationSkin,
+                        MaximumCorrectionPerStep);
+                }
+            }
+            if(correction.sqrMagnitude<0.000001f) return false;
+            body.position+=correction;
+            float inwardSpeed=Vector3.Dot(body.linearVelocity,separatingNormal);
+            if(inwardSpeed<0f)
+                body.linearVelocity-=separatingNormal*inwardSpeed;
+            body.WakeUp();
+            return true;
+        }
+    }
+
     // Static remainder colliders live on a new child; Unity sends their contact
     // callbacks to that child. Forward them to the original material owner.
     public sealed class PhysicalDestructionCollisionRelay : MonoBehaviour
@@ -1469,6 +1983,7 @@ namespace Wyvernland
         static void ResetActiveColliders() => activeColliders.Clear();
         void Awake()
         {
+            FragmentMassCenter.Align(GetComponent<Rigidbody>());
             foreach(var collider in GetComponentsInChildren<Collider>(true))
                 TrackCollider(collider);
         }
@@ -1477,6 +1992,11 @@ namespace Wyvernland
             if(collider==null||!activeColliders.Add(collider)) return;
             registeredColliders.Add(collider);
             TemporaryShatterDebris.IgnoreForNewFragment(collider);
+        }
+        internal void UntrackCollider(Collider collider)
+        {
+            activeColliders.Remove(collider);
+            registeredColliders.Remove(collider);
         }
         void OnDestroy()
         {
@@ -1488,6 +2008,9 @@ namespace Wyvernland
             foreach(var fragment in FindObjectsByType<DestructionFragment>(FindObjectsInactive.Include,FindObjectsSortMode.None))
             {
                 if(fragment==null) continue;
+                if(fragment.GetComponent<SmallFragmentRest>()!=null||
+                    fragment.GetComponent<PhysicalDestructible>() is {} physical&&
+                    physical.SolidVolumeCubicMetres<PhysicalDestructible.MinimumFragmentationVolume) continue;
                 bool held=false;
                 foreach(var item in fragment.GetComponentsInParent<PickableObject>(true)) held|=item.IsHeld;
                 foreach(var item in fragment.GetComponentsInChildren<PickableObject>(true)) held|=item.IsHeld;
@@ -1501,150 +2024,70 @@ namespace Wyvernland
         }
     }
 
-    // Temporary debris from an undersized fragment can hit the world, but never
-    // starts another fragment-on-fragment collision cascade.
+    // Small Shatter pieces keep their appearance and ignore other fragments
+    // to avoid collision cascades. SmallFragmentRest retires only their physics.
     public sealed class TemporaryShatterDebris : MonoBehaviour
     {
         static readonly HashSet<Collider> activeColliders=new();
-        const int MaximumLiveDebris=32;
-        static int liveDebris;
-        internal static bool CanSpawn => liveDebris<MaximumLiveDebris;
-        static readonly int BaseColorId=Shader.PropertyToID("_BaseColor");
-        static readonly int ColorId=Shader.PropertyToID("_Color");
-        static readonly int FadeAlphaId=Shader.PropertyToID("_FadeAlpha");
         Collider debrisCollider;
-        Material[] fadeMaterials;
-        float spawnedAt;
-        Vector3 originalScale;
-        public const float DebrisLifetimeSeconds=5f;
-        public float LifetimeSeconds { get; private set; }
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        static void ResetActiveColliders()
-        { activeColliders.Clear(); liveDebris=0; }
+        static void ResetActiveColliders() => activeColliders.Clear();
 
         void Awake()
         {
-            liveDebris++;
+            SmallFragmentRest.Ensure(gameObject);
             debrisCollider=GetComponent<Collider>();
-            if(debrisCollider!=null)
-            {
-                foreach(var collider in DestructionFragment.ActiveColliders)
-                    IgnorePair(debrisCollider,collider);
-                activeColliders.Add(debrisCollider);
-            }
-            LifetimeSeconds=DebrisLifetimeSeconds;
-            spawnedAt=Time.unscaledTime;
-            originalScale=transform.localScale;
-            PrepareFadeMaterials();
-            // Keep the deletion scheduled even if streaming disables Update.
-            if(Application.isPlaying) Destroy(gameObject,LifetimeSeconds);
+            if(debrisCollider==null) return;
+            foreach(var collider in DestructionFragment.ActiveColliders)
+                IgnorePair(debrisCollider,collider);
+            activeColliders.Add(debrisCollider);
         }
 
-        void PrepareFadeMaterials()
-        {
-            var renderer=GetComponent<MeshRenderer>();
-            Shader shader=Resources.Load<Shader>("FadingFragment")??
-                Shader.Find("Wyvernland/Fading Fragment");
-            if(renderer==null||shader==null) return;
-            var original=renderer.sharedMaterials;
-            fadeMaterials=new Material[original.Length];
-            var block=new MaterialPropertyBlock();
-            var overall=new MaterialPropertyBlock();
-            renderer.GetPropertyBlock(overall);
-            for(int i=0;i<original.Length;i++)
-            {
-                Material source=original[i];
-                Color color=source!=null&&source.HasProperty(BaseColorId)?
-                    source.GetColor(BaseColorId):
-                    source!=null&&source.HasProperty(ColorId)?source.GetColor(ColorId):Color.white;
-                renderer.GetPropertyBlock(block,i);
-                Color overrideColor=block.GetColor(BaseColorId);
-                if(HasTint(overrideColor)) color=overrideColor;
-                else
-                {
-                    overrideColor=block.GetColor(ColorId);
-                    if(HasTint(overrideColor)) color=overrideColor;
-                    else
-                    {
-                        overrideColor=overall.GetColor(BaseColorId);
-                        if(!HasTint(overrideColor)) overrideColor=overall.GetColor(ColorId);
-                        if(HasTint(overrideColor)) color=overrideColor;
-                    }
-                }
-                var fade=new Material(shader) { name="Temporary fragment fade" };
-                fade.SetColor(BaseColorId,color);
-                fade.SetFloat(FadeAlphaId,1f);
-                fadeMaterials[i]=fade;
-                renderer.SetPropertyBlock(null,i);
-                block.Clear();
-            }
-            renderer.sharedMaterials=fadeMaterials;
-        }
-
-        static bool HasTint(Color color) =>
-            color.maxColorComponent>0f||color.a>0f;
-
-        void Update()
-        {
-            float elapsed=Time.unscaledTime-spawnedAt;
-            if(elapsed>=LifetimeSeconds)
-            {
-                GetComponent<TreeStructuralPart>()?.ReleaseChildren();
-                Destroy(gameObject);
-                return;
-            }
-            float fadeStart=LifetimeSeconds*0.35f;
-            float progress=Mathf.Clamp01((elapsed-fadeStart)/
-                Mathf.Max(0.0001f,LifetimeSeconds-fadeStart));
-            float opacity=1f-Mathf.SmoothStep(0f,1f,progress);
-            transform.localScale=originalScale*Mathf.Max(0.05f,opacity);
-            if(fadeMaterials==null) return;
-            foreach(var material in fadeMaterials)
-                if(material!=null) material.SetFloat(FadeAlphaId,opacity);
-        }
-
+        internal static void UntrackCollider(Collider collider) => activeColliders.Remove(collider);
         internal static void IgnoreForNewFragment(Collider collider)
         {
             foreach(var debris in activeColliders) IgnorePair(debris,collider);
         }
-
         static void IgnorePair(Collider a,Collider b)
         {
             if(a!=null&&b!=null&&a!=b&&!a.isTrigger&&!b.isTrigger)
                 Physics.IgnoreCollision(a,b,true);
         }
-
         void OnDestroy()
         {
-            liveDebris=Mathf.Max(0,liveDebris-1);
             GetComponent<TreeStructuralPart>()?.ReleaseChildren();
             activeColliders.Remove(debrisCollider);
-            if(fadeMaterials==null) return;
-            foreach(var material in fadeMaterials)
-                if(material!=null)
-                {
-                    if(Application.isPlaying) Destroy(material);
-                    else DestroyImmediate(material);
-                }
         }
     }
 
-    // Discover streamed/generated objects, with collision-time registration closing
+    // Register generated scene objects once, with collision-time registration closing
     // the gap between spawning a collider and the next discovery pass.
     public sealed class PhysicalDestructionWorld : MonoBehaviour
     {
-        float nextScan;
-        void Update()
+        public void RegisterSceneObjects()
         {
-            PhysicalDestructible.DrainPendingFragments();
-            if(Time.time<nextScan) return; nextScan=Time.time+1f;
+            var routine=RegisterSceneObjectsIncrementally();
+            while(routine.MoveNext()) { }
+        }
+
+        internal System.Collections.IEnumerator RegisterSceneObjectsIncrementally()
+        {
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
             foreach(var collider in FindObjectsByType<Collider>(FindObjectsInactive.Include,FindObjectsSortMode.None))
+            {
                 PhysicalDestructible.Resolve(collider);
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
             foreach(var renderer in FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
             {
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
                 if(!renderer.enabled) continue;
+                if(renderer.GetComponent<ResidentRenderVisual>()!=null) continue;
                 if(renderer.GetComponent<TreeImpactMarker>()!=null) continue;
+                if(renderer.GetComponentInParent<RopeObject>()!=null) continue;
                 if(renderer.GetComponentInParent<FirstPersonController>(true)!=null) continue;
                 // A visual assembly containing registered destructible children
                 // must not become a second destruction target over those meshes.
@@ -1658,7 +2101,6 @@ namespace Wyvernland
                 PhysicalDestructible.Ensure(renderer.gameObject);
             }
         }
-        void OnDestroy() => PhysicalDestructible.ClearPendingFragments();
     }
 }
 

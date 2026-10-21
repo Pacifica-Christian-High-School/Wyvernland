@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 
 namespace Wyvernland
@@ -143,6 +144,19 @@ namespace Wyvernland
             "Basalt"
         };
 
+        // Metal names are kept separate from ores and other minerals. New
+        // metal materials can be added here without changing impact rules.
+        public static readonly string[] MetalMaterials =
+        {
+            "Iron", "Native Copper", "Steel", "Copper", "Bronze", "Brass",
+            "Silver", "Gold", "Tin", "Lead", "Zinc", "Nickel",
+            "Aluminum", "Aluminium", "Titanium"
+        };
+
+        public static bool IsMetalMaterial(string material) =>
+            !string.IsNullOrEmpty(material)&&Array.Exists(MetalMaterials,
+                name=>string.Equals(name,material,StringComparison.OrdinalIgnoreCase));
+
         // Approximate beginning temperatures in degrees Celsius. Ranges are
         // retained so later temperature simulation can choose a value based on
         // moisture, purity, composition or object-specific variation.
@@ -152,10 +166,11 @@ namespace Wyvernland
             new("Wood",ThermalTransitionKind.Smoke,200f,250f,2f,3f,7,"All trees and stumps"),
             new("Burnt Wood",ThermalTransitionKind.Smoke,200f,250f,1.5f,2.5f,5,
                 "Burnt trees and stumps",3f,7f),
+            new("Iron",ThermalTransitionKind.Melt,1538f,1538f,6f,8f,8,"All iron objects"),
             new("Quartz",ThermalTransitionKind.Melt,1713f,1713f,7f,7f,3,"All quartz objects"),
             new("Magnetite",ThermalTransitionKind.Melt,1597f,1597f,5.5f,6.5f,4,"All magnetite objects"),
             new("Limestone",ThermalTransitionKind.Melt,825f,825f,3f,4f,3,"All limestone objects"),
-            new("Stone",ThermalTransitionKind.Melt,1000f,1300f,4f,7f,5,"All stone objects"),
+            new("Stone",ThermalTransitionKind.Melt,1000f,1300f,2f,5f,2,"All stone objects"),
             new("River Rock",ThermalTransitionKind.Melt,1000f,1300f,5f,7f,6,"All river-rock objects"),
             new("Chalk stone",ThermalTransitionKind.Melt,825f,825f,1f,3f,2,"All chalk-stone objects"),
             new("Obsidian",ThermalTransitionKind.Melt,1000f,1200f,5f,5.5f,1,"All obsidian objects"),

@@ -25,7 +25,7 @@ namespace Wyvernland.Editor
             {
                 terrain.AddSurface(surface,null,"Ground",colliders.Add);
                 var renderers=root.GetComponentsInChildren<MeshRenderer>();
-                Require(renderers.Length<colliders.Count,"Terrain collision tiles must share render batches");
+                Require(renderers.Length==1&&colliders.Count==1,"The original surface must remain whole");
                 Physics.SyncTransforms();
                 CheckHeight(colliders,10,10,0);
                 var before=colliders.ToDictionary(c=>c,c=>c.sharedMesh);
@@ -39,8 +39,8 @@ namespace Wyvernland.Editor
                 Require(renderers.Any(r=>r.GetComponent<MeshFilter>().sharedMesh.colors.Any(c=>c.r<0.6f)),
                     "Batched rendering lost the dark pit interior");
                 CheckHeight(colliders,10.6f,10,0);
-                Require(terrain.LastRebuiltTileCount==1,"Only one tile rebuilt");
-                Require(colliders.Count(c=>c.sharedMesh!=before[c])==1,"Other tile meshes unchanged");
+                Require(terrain.LastRebuiltSurfaceCount==1,"One surface rebuilt");
+                Require(colliders.Count(c=>c.sharedMesh!=before[c])==1,"Other surface meshes unchanged");
                 Mesh carved=colliders.Single(c=>c.sharedMesh!=before[c]).sharedMesh;
                 Require(carved.colors.Any(c=>Mathf.Abs(c.r-0.55f)<0.001f)&&carved.colors.Any(c=>c==Color.white),
                     "Pit facets are darkened while original ground remains white");
@@ -49,13 +49,13 @@ namespace Wyvernland.Editor
                 CheckHeight(colliders,9.6f,10,-0.5f);
                 CheckHeight(colliders,10.2f,10,-0.6f);
                 terrain.Subtract(stone,Matrix4x4.TRS(new Vector3(0,0,0),Quaternion.identity,Vector3.one));
-                Require(terrain.LastRebuiltTileCount==4,"Boundary cut touches exactly four tiles");
+                Require(terrain.LastRebuiltSurfaceCount==1,"A cut rebuilds one whole surface");
                 CheckHeight(colliders,-0.1f,0.1f,-0.5f);
                 CheckHeight(colliders,0.1f,-0.1f,-0.5f);
                 terrain.Subtract(stone,Matrix4x4.TRS(new Vector3(20,0,20),Quaternion.identity,Vector3.one*0.064f));
                 CheckHeight(colliders,20,20,-0.032f);
                 terrain.Subtract(stone,Matrix4x4.TRS(new Vector3(30,3,30),Quaternion.identity,Vector3.one));
-                Require(terrain.LastRebuiltTileCount==0,"Floating stone leaves terrain unchanged");
+                Require(terrain.LastRebuiltSurfaceCount==0,"Floating stone leaves terrain unchanged");
                 CheckHeight(colliders,30,30,0);
                 CheckHeight(colliders,90,90,0);
                 terrain.Subtract(stone,Matrix4x4.TRS(new Vector3(40,0,40),Quaternion.Euler(0,45,0),Vector3.one));
@@ -64,9 +64,9 @@ namespace Wyvernland.Editor
                 Require(terrain.Raycast(new Ray(new Vector3(40,10,40),Vector3.down),100,out var indexedHit)
                     &&Mathf.Abs(indexedHit.point.y+0.5f)<0.001f,"Indexed height query sees pit");
                 Require(terrain.Raycast(new Ray(new Vector3(0,10,0),Vector3.down),100,out indexedHit)
-                    &&Mathf.Abs(indexedHit.point.y+0.5f)<0.001f,"Indexed height query sees tile seam pit");
-                Debug.Log("STONE_CUTOUT_VALIDATION_PASS: collider depth, locality, overlapping cuts, tile seams, small stones, floating stones, rotated shape, indexed height queries.");
-                Debug.Log($"TERRAIN_RENDER_BATCH_PASS: {colliders.Count} collision tiles rendered using {renderers.Length} renderers; pit geometry and colors updated.");
+                    &&Mathf.Abs(indexedHit.point.y+0.5f)<0.001f,"Indexed height query sees successive pit");
+                Debug.Log("STONE_CUTOUT_VALIDATION_PASS: collider depth, locality, overlapping cuts, successive cuts, small stones, floating stones, rotated shape, indexed height queries.");
+                Debug.Log($"RESIDENT_TERRAIN_PASS: {colliders.Count} whole surfaces rendered using {renderers.Length} renderers; pit geometry and colors updated.");
             }
             finally
             {

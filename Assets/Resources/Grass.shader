@@ -1,128 +1,101 @@
 Shader "Wyvernland/Pixel Grass"
 {
-    Properties
-    {
-        _DrawDistance ("Draw distance", Float) = 80
-        _FadeStart ("Distance fade start", Float) = 36
-        _FadeDuration ("Load fade duration", Float) = 1.25
-        [HideInInspector] _SpawnTime ("Spawn time", Float) = 0
-        [HideInInspector] _MediumTextureQuality ("Medium texture quality", Float) = 0
-    }
+    Properties { [HideInInspector] _MediumTextureQuality ("Medium texture quality",Float)=0 }
     SubShader
     {
-        Tags { "RenderPipeline"="UniversalPipeline" "Queue"="Transparent" "RenderType"="Transparent" }
+        Tags { "RenderPipeline"="UniversalPipeline" "Queue"="Transparent" "RenderType"="TransparentCutout" }
         Pass
         {
             Tags { "LightMode"="UniversalForwardOnly" }
-            Cull Off
-            ZWrite Off
-            Blend SrcAlpha OneMinusSrcAlpha
+            Cull Off ZWrite On
             HLSLPROGRAM
+            #pragma target 3.5
             #pragma vertex Vert
             #pragma fragment Frag
-            #pragma multi_compile_fog
+            #pragma multi_compile_instancing
+            #pragma instancing_options assumeuniformscaling
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+            TEXTURE2D(_GrassSurfaceMap); SAMPLER(sampler_GrassSurfaceMap);
+            TEXTURE2D(_GrassDensityMap); SAMPLER(sampler_GrassDensityMap);
             CBUFFER_START(UnityPerMaterial)
-            float _DrawDistance;
-            float _FadeStart;
-            float _FadeDuration;
-            float _SpawnTime;
+            float4 _GrassMapBounds;
+            float4 _GrassSurfaceGrid;
+            float _GrassDensity;
+            float _GrassPixelsPerMetre;
             float _MediumTextureQuality;
             CBUFFER_END
             float4 _WyvernFogColor;
             float4 _WyvernFogParams;
-            struct Attributes { float4 positionOS:POSITION; half4 color:COLOR; float3 shapeUV:TEXCOORD0; };
-            struct Varyings
+            struct Input { float4 position:POSITION; float2 uv:TEXCOORD0; UNITY_VERTEX_INPUT_INSTANCE_ID };
+            struct Output { float4 position:SV_POSITION; half4 color:COLOR; float3 shapeUV:TEXCOORD0; float3 world:TEXCOORD1; };
+            float Hash(float2 p,float salt)
             {
-                float4 positionCS:SV_POSITION;
-                half4 color:COLOR;
-                float3 shapeUV:TEXCOORD0;
-                float3 world:TEXCOORD1;
-                half fog:TEXCOORD2;
-            };
-            Varyings Vert(Attributes input)
+                float3 h=frac(float3(p.x,p.y,salt)*.1031);
+                h+=dot(h,h.yzx+33.33);
+                return frac((h.x+h.y)*h.z);
+            }
+            half3 Palette(float id)
             {
-                Varyings output;
-                output.world=TransformObjectToWorld(input.positionOS.xyz);
-                output.positionCS=TransformWorldToHClip(output.world);
-                output.color=input.color;
-                output.shapeUV=input.shapeUV;
-                output.fog=ComputeFogFactor(output.positionCS.z);
+                half3 color=id<1?half3(.7451,.4784,.3373):
+                    (id<2?half3(.6902,.3098,.1216):half3(.502,.2157,.098));
+                #ifndef UNITY_COLORSPACE_GAMMA
+                    color=SRGBToLinear(color);
+                #endif
+                return color;
+            }
+            Output Vert(Input input)
+            {
+                UNITY_SETUP_INSTANCE_ID(input);
+                Output output=(Output)0;
+                float3 cell=TransformObjectToWorld(input.position.xyz);
+                float2 xz=cell.xz+.25+float2(Hash(cell.xz,11),Hash(cell.xz,23))*.5;
+                float2 mapUV=(xz-_GrassMapBounds.xy)*_GrassMapBounds.zw;
+                half3 distribution=SAMPLE_TEXTURE2D_LOD(_GrassDensityMap,sampler_GrassDensityMap,mapUV,0).rgb;
+                float4 surface=SAMPLE_TEXTURE2D_LOD(_GrassSurfaceMap,sampler_GrassSurfaceMap,mapUV,0);
+                // Project from the sampled terrain plane to this clump's actual
+                // position so a compact height atlas doesn't produce stepped grass.
+                float2 sampleXZ=_GrassMapBounds.xy+(floor(mapUV*_GrassSurfaceGrid.xy)+.5)*_GrassSurfaceGrid.zw;
+                surface.x-=dot(surface.yw,xz-sampleXZ)/max(.25,surface.z);
+                float2 patch=floor(xz/7);
+                int first=(int)(Hash(patch,37)*3);
+                int count=1+(int)(Hash(patch,43)*3);
+                int shape=(first+(int)(Hash(xz,47)*count))%3;
+                float height=distribution.g>.5?lerp(.18,.45,Hash(xz,53)):
+                    lerp(distribution.b>.5?.5:.4,1,Hash(xz,53));
+                float3 centre=float3(xz.x,surface.x,xz.y);
+                float distanceToEye=distance(centre,_WorldSpaceCameraPos);
+                bool valid=all(mapUV>=0)&&all(mapUV<=1)&&surface.z>.25&&
+                    Hash(xz,59)<distribution.r*_GrassDensity&&height*_GrassPixelsPerMetre/max(1,distanceToEye)>.5;
+                if(!valid) { output.position=float4(-2,-2,0,1);return output; }
+                float3 normal=normalize(surface.yzw);
+                float angle=Hash(xz,61)*6.2831853;
+                float3 right=normalize(cross(normal,float3(sin(angle),0,cos(angle))));
+                float3 up=normalize(cross(right,cross(normal,right)));
+                float width=shape==0?11./9.:(shape==1?13./9.:14./13.);
+                output.world=centre+normal*.002+right*(input.uv.x-.5)*width*height+up*input.uv.y*height;
+                output.position=TransformWorldToHClip(output.world);
+                float2 region=xz/266;
+                float2 grid=floor(region),blend=smoothstep(0,1,frac(region));
+                half3 a=lerp(Palette(floor(Hash(grid,67)*3)),Palette(floor(Hash(grid+float2(1,0),67)*3)),blend.x);
+                half3 b=lerp(Palette(floor(Hash(grid+float2(0,1),67)*3)),Palette(floor(Hash(grid+1,67)*3)),blend.x);
+                output.color=half4(lerp(a,b,blend.y)*lerp(.936,1.064,Hash(xz,71)),lerp(.4,.6,Hash(xz,73)));
+                output.shapeUV=float3(input.uv,shape);
                 return output;
             }
-
-            float PixelRect(float2 pixel,float4 rect)
+            #include "GrassShapes.hlsl"
+            half4 Frag(Output input):SV_Target
             {
-                return step(rect.x,pixel.x)*step(rect.y,pixel.y)*
-                    (1-step(rect.x+rect.z,pixel.x))*(1-step(rect.y+rect.w,pixel.y));
-            }
-
-            float ShapeMask(float3 shapeUV)
-            {
-                int type=(int)round(shapeUV.z);
-                float2 dimensions=type==0?float2(11,9):
-                    (type==1?float2(13,9):float2(14,13));
-                float2 pixel=min(floor(saturate(shapeUV.xy)*dimensions),dimensions-1);
-                float mask=0;
-                if(type==0)
-                {
-                    mask+=PixelRect(pixel,float4(0,4,1,3));
-                    mask+=PixelRect(pixel,float4(1,0,1,5));
-                    mask+=PixelRect(pixel,float4(4,0,1,9));
-                    mask+=PixelRect(pixel,float4(6,0,1,3));
-                    mask+=PixelRect(pixel,float4(7,2,1,5));
-                    mask+=PixelRect(pixel,float4(10,0,1,7));
-                }
-                else if(type==1)
-                {
-                    mask+=PixelRect(pixel,float4(0,3,2,2));
-                    mask+=PixelRect(pixel,float4(1,1,2,2));
-                    mask+=PixelRect(pixel,float4(2,0,2,1));
-                    mask+=PixelRect(pixel,float4(4,0,1,9));
-                    mask+=PixelRect(pixel,float4(3,7,1,2));
-                    mask+=PixelRect(pixel,float4(7,0,1,5));
-                    mask+=PixelRect(pixel,float4(8,3,1,2));
-                    mask+=PixelRect(pixel,float4(11,0,1,8));
-                    mask+=PixelRect(pixel,float4(12,6,1,2));
-                }
-                else
-                {
-                    mask+=PixelRect(pixel,float4(0,4,2,3));
-                    mask+=PixelRect(pixel,float4(1,7,1,1));
-                    mask+=PixelRect(pixel,float4(1,3,2,1));
-                    mask+=PixelRect(pixel,float4(2,0,1,3));
-                    mask+=PixelRect(pixel,float4(3,11,1,2));
-                    mask+=PixelRect(pixel,float4(4,12,1,1));
-                    mask+=PixelRect(pixel,float4(5,0,1,13));
-                    mask+=PixelRect(pixel,float4(7,0,1,5));
-                    mask+=PixelRect(pixel,float4(8,4,1,2));
-                    mask+=PixelRect(pixel,float4(9,5,1,1));
-                    mask+=PixelRect(pixel,float4(10,6,1,1));
-                    mask+=PixelRect(pixel,float4(11,4,1,1));
-                    mask+=PixelRect(pixel,float4(12,0,1,4));
-                    mask+=PixelRect(pixel,float4(13,3,1,1));
-                }
-                return saturate(mask);
-            }
-
-            half4 Frag(Varyings input):SV_Target
-            {
-                // One quad carries the original pixel silhouette. Clipping its
-                // unused pixels reduces each clump from 6–14 quads to one.
-                clip(ShapeMask(input.shapeUV)-0.5);
-                float fade=1-smoothstep(_FadeStart,_DrawDistance,
-                    distance(input.world,_WorldSpaceCameraPos));
-                float loadFade=smoothstep(0,1,saturate((_Time.y-_SpawnTime)/max(_FadeDuration,0.001)));
-                float runtimeFog=saturate((distance(input.world,_WorldSpaceCameraPos)-_WyvernFogParams.x)/
-                    max(0.001,_WyvernFogParams.y-_WyvernFogParams.x))*_WyvernFogParams.z;
-                half3 grassColor=input.color.rgb;
-                if(_MediumTextureQuality>0.5)
-                {
-                    const half3 litGrass=half3(0.43,0.16,0.055);
-                    grassColor=litGrass;
-                }
-                half3 color=lerp(grassColor,_WyvernFogColor.rgb,runtimeFog);
-                return half4(color,input.color.a*fade*loadFade);
+                clip(ShapeMask(input.shapeUV)-.5);
+                // Depth-writing coverage retains the translucent appearance without
+                // sorting and repeatedly blending thousands of overlapping quads.
+                float coverage=frac(dot(floor(input.position.xy),float2(.754877666,.569840296)));
+                clip(input.color.a-coverage);
+                half3 color=input.color.rgb;
+                if(_MediumTextureQuality>.5) color=half3(.43,.16,.055);
+                float fog=saturate((distance(input.world,_WorldSpaceCameraPos)-_WyvernFogParams.x)/
+                    max(.001,_WyvernFogParams.y-_WyvernFogParams.x))*_WyvernFogParams.z;
+                return half4(lerp(color,_WyvernFogColor.rgb,fog),1);
             }
             ENDHLSL
         }

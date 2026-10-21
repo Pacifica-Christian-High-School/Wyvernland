@@ -338,6 +338,50 @@ namespace Wyvernland.Editor
                 set("punching",false); avatar.BeginRightHandPunch();
                 Require(!(bool)typeof(RiggedPlayerAvatar).GetField("punching",flags).GetValue(avatar),
                     "Stick mode unexpectedly started a Regular punch.");
+                set("punching",false);
+                set("heldRightHandItem",pickable);
+                var leftDigits=(Transform[])typeof(RiggedPlayerAvatar).GetField(
+                    "leftGripDigits",flags).GetValue(avatar);
+                for(int i=0;i<leftDigits.Length;i++)
+                {
+                    leftDigits[i]=new GameObject("Left "+Names[i]).transform;
+                    leftDigits[i].SetParent(elbow);
+                    digits[i].localRotation=Quaternion.identity;
+                    leftDigits[i].localRotation=Quaternion.identity;
+                }
+                set("heldLeftHandItem",pickable);
+                typeof(RiggedPlayerAvatar).GetMethod("ApplyRightHandObjectGripPose",flags)
+                    .Invoke(avatar,null);
+                typeof(RiggedPlayerAvatar).GetMethod("ApplyLeftHandObjectGripPose",flags)
+                    .Invoke(avatar,null);
+                Vector3[] fist={new(0,0,-24),new(0,0,75),new(0,0,80),
+                    new(-40,0,15),new(55,0,0)};
+                var mirror=typeof(RiggedPlayerAvatar).GetMethod("MirrorPunchPose",
+                    flags|System.Reflection.BindingFlags.Static);
+                for(int i=0;i<digits.Length;i++)
+                {
+                    Quaternion punchPose=Quaternion.Euler(fist[i]);
+                    Require(Quaternion.Angle(digits[i].localRotation,punchPose)<0.01f&&
+                        Quaternion.Angle(leftDigits[i].localRotation,
+                            (Quaternion)mirror.Invoke(null,new object[]{punchPose}))<0.01f,
+                        "Both hands retain the punch finger pose while holding a Stick.");
+                }
+                var heldPunch=typeof(RiggedPlayerAvatar).GetMethod(
+                    "ApplyHeldPunchFingerPose",flags);
+                foreach(bool left in new[]{false,true})
+                {
+                    set("punchUsingLeftHand",left);
+                    Transform[] activeDigits=left?leftDigits:digits;
+                    foreach(var digit in activeDigits) digit.localRotation=Quaternion.identity;
+                    heldPunch.Invoke(avatar,null);
+                    for(int i=0;i<activeDigits.Length;i++)
+                    {
+                        Quaternion punchPose=Quaternion.Euler(fist[i]);
+                        if(left) punchPose=(Quaternion)mirror.Invoke(null,new object[]{punchPose});
+                        Require(Quaternion.Angle(activeDigits[i].localRotation,punchPose)<0.01f,
+                            "A held Stick keeps the punch finger pose during punch animation.");
+                    }
+                }
                 Debug.Log("REGULAR_HELD_PUNCH_VALIDATION_PASS: matching empty-hand animation, exact finger override, contact return, and Stick exclusion.");
             }
             finally { UnityEngine.Object.DestroyImmediate(root); }

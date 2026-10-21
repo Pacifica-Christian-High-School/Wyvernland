@@ -64,7 +64,7 @@ namespace Wyvernland.Editor
                 string[] names={"Grass","Wood","Quartz","Magnetite","Limestone","Stone","River Rock",
                     "Chalk Stone","Obsidian","Coal","Hematite","Native Copper","Pyrite","Chalcocite",
                     "Limonite","Cassiterite","Galena","Sulfur","Saltpeter","Meteorite","Basalt"};
-                float[] densities={150,650,2650,5170,2600,2700,2650,2200,2370,1300,5260,8960,5010,
+                float[] densities={150,650,2650,5170,2600,2295,2650,2200,2370,1300,5260,8960,5010,
                     5700,3500,7000,7600,2070,2110,5500,3000};
                 for(int i=0;i<names.Length;i++)
                     Require(MaterialDensity.TryGet(names[i].ToLowerInvariant(),out float density)&&density==densities[i],

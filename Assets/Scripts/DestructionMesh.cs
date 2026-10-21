@@ -9,6 +9,13 @@ namespace Wyvernland
     public static class DestructionMesh
     {
         private const float Epsilon = 0.00001f;
+        internal const int MaximumRefinedChipFaces=4096;
+        internal static int FaceCount(Mesh mesh)
+        {
+            long indices=0;
+            for(int slot=0;slot<mesh.subMeshCount;slot++) indices+=(long)mesh.GetIndexCount(slot);
+            return (int)Math.Min(int.MaxValue,indices/3);
+        }
         sealed class ValidationCache
         {
             public readonly Dictionary<Mesh,bool> closed=new();
@@ -56,7 +63,7 @@ namespace Wyvernland
             public Builder(int slots) { triangles=new List<int>[Math.Max(1,slots)]; for(int i=0;i<triangles.Length;i++) triangles[i]=new(); }
             public void Triangle(Vertex a,Vertex b,Vertex c,int slot)
             {
-                if(Vector3.Cross(b.P-a.P,c.P-a.P).sqrMagnitude<1e-16f) return;
+                if(Vector3.Cross(b.P-a.P,c.P-a.P).sqrMagnitude<1e-24f) return;
                 Add(a,slot); Add(b,slot); Add(c,slot);
             }
             void Add(Vertex vertex,int slot)
@@ -129,7 +136,7 @@ namespace Wyvernland
                     int c=welded[indices[i+2]];
                     if(a==b||b==c||c==a||
                         Vector3.Cross(vertices[indices[i+1]]-vertices[indices[i]],
-                            vertices[indices[i+2]]-vertices[indices[i]]).sqrMagnitude<1e-16f)
+                            vertices[indices[i+2]]-vertices[indices[i]]).sqrMagnitude<1e-24f)
                         return false;
                     int first=a,second=b,third=c;
                     if(first>second) (first,second)=(second,first);
@@ -172,8 +179,14 @@ namespace Wyvernland
         }
         static int[] WeldedVertexIds(Vector3[] vertices)
         {
-            const float cell=0.0001f;
-            const float tolerance=0.00011f;
+            // Preserve small cap edges. A fixed 0.11 mm seam tolerance merged
+            // distinct cut vertices after repeated chipping. Far-from-origin
+            // meshes still need enough tolerance for their float precision.
+            float largest=0f;
+            foreach(Vector3 vertex in vertices)
+                largest=Mathf.Max(largest,Mathf.Max(Mathf.Abs(vertex.x),Mathf.Max(Mathf.Abs(vertex.y),Mathf.Abs(vertex.z))));
+            float tolerance=Mathf.Max(Epsilon,largest*0.00000012f);
+            float cell=tolerance;
             var buckets=new Dictionary<Vector3Int,List<int>>();
             var exact=new Dictionary<Vector3,int>(vertices.Length);
             var parent=new int[vertices.Length];
@@ -230,7 +243,7 @@ namespace Wyvernland
                 {
                     int a=indices[i],b=indices[i+1],c=indices[i+2];
                     if(Vector3.Cross(vertices[b].P-vertices[a].P,
-                        vertices[c].P-vertices[a].P).sqrMagnitude<1e-16f) continue;
+                        vertices[c].P-vertices[a].P).sqrMagnitude<1e-24f) continue;
                     faces.Add((a,b,c,slot));
                 }
             }
@@ -290,7 +303,7 @@ namespace Wyvernland
                     // A cut beside an existing ring can leave a sliver whose
                     // corners weld together. It has no area and must not add
                     // phantom boundary edges to the cap contour.
-                    if(Vector3.Cross(face[1].P-face[0].P,face[2].P-face[0].P).sqrMagnitude<1e-16f)
+                    if(Vector3.Cross(face[1].P-face[0].P,face[2].P-face[0].P).sqrMagnitude<1e-24f)
                         continue;
                     builder.Triangle(face[0],face[1],face[2],slot);
                     for(int j=0;j<3;j++)
@@ -425,7 +438,7 @@ namespace Wyvernland
                     {
                         var a=face[j]; var b=face[(j+1)%3]; float da=plane.GetDistanceToPoint(a.P),db=plane.GetDistanceToPoint(b.P);
                         if(Mathf.Abs(da)<=Epsilon) AddUnique(cut,a);
-                        if(da> Epsilon&&db< -Epsilon||da< -Epsilon&&db> Epsilon) AddUnique(cut,Vertex.Lerp(a,b,da/(da-db)));
+                        if(da> Epsilon&&db< -Epsilon||da< -Epsilon&&db> Epsilon) AddUnique(cut,PlaneIntersection(a,b,da,db));
                     }
                     if(cut.Count==2&&(cut[0].P-cut[1].P).sqrMagnitude>Epsilon*Epsilon&&
                        !segments.Exists(s=>Near(s.a,cut[0])&&Near(s.b,cut[1])||Near(s.a,cut[1])&&Near(s.b,cut[0])))
@@ -433,6 +446,7 @@ namespace Wyvernland
                 }
             }
             // Stitch each disconnected cut contour separately, then triangulate concave contours.
+            var contours=new List<List<Vertex>>();
             while(segments.Count>0)
             {
                 var loop=new List<Vertex>{segments[0].a,segments[0].b}; segments.RemoveAt(0);
@@ -450,8 +464,9 @@ namespace Wyvernland
                     if(Near(next,loop[0])) { closed=true; break; }
                     loop.Add(next);
                 }
-                if(closed) Cap(loop,plane.normal,front,back);
+                if(closed) contours.Add(loop);
             }
+            CapContours(contours,plane.normal,front,back);
             positive=front.Build(); negative=back.Build(); return positive!=null&&negative!=null;
         }
         static bool Near(Vertex a,Vertex b)=>(a.P-b.P).sqrMagnitude<Epsilon*Epsilon*4;
@@ -468,9 +483,20 @@ namespace Wyvernland
                 // A vertex on the plane already belongs to both halves. Adding
                 // an interpolation at that same point creates zero-length edges.
                 if(inside!=next&&Mathf.Abs(da)>Epsilon&&Mathf.Abs(db)>Epsilon)
-                    AddUnique(polygon,Vertex.Lerp(a,b,da/(da-db)));
+                    AddUnique(polygon,PlaneIntersection(a,b,da,db));
             }
             for(int i=1;i+1<polygon.Count;i++) builder.Triangle(polygon[0],polygon[i],polygon[i+1],slot);
+        }
+        static Vertex PlaneIntersection(Vertex a,Vertex b,float da,float db)
+        {
+            Vertex result=Vertex.Lerp(a,b,da/(da-db));
+            // Adjacent faces visit their shared edge in opposite directions.
+            // Symmetric double arithmetic gives both the same cut position.
+            double divisor=(double)da-db;
+            result.P=new Vector3((float)(((double)b.P.x*da-(double)a.P.x*db)/divisor),
+                (float)(((double)b.P.y*da-(double)a.P.y*db)/divisor),
+                (float)(((double)b.P.z*da-(double)a.P.z*db)/divisor));
+            return result;
         }
         static void Cap(List<Vertex> loop,Vector3 normal,Builder front,Builder back)
         {
@@ -485,15 +511,16 @@ namespace Wyvernland
                 {
                     int prev=(i+loop.Count-1)%loop.Count,next=(i+1)%loop.Count;
                     var a=loop[prev]; var b=loop[i]; var c=loop[next];
-                    if(Vector3.Dot(Vector3.Cross(b.P-a.P,c.P-b.P),normal)<=1e-10f) continue;
+                    if(Turn(a.P,b.P,c.P,normal)<=1e-12) continue;
                     bool contains=false;
                     for(int j=0;j<loop.Count;j++)
                     {
                         if(j==prev||j==i||j==next) continue;
                         Vector3 p=loop[j].P;
-                        if(Vector3.Dot(Vector3.Cross(b.P-a.P,p-a.P),normal)>=-1e-9f&&
-                           Vector3.Dot(Vector3.Cross(c.P-b.P,p-b.P),normal)>=-1e-9f&&
-                           Vector3.Dot(Vector3.Cross(a.P-c.P,p-c.P),normal)>=-1e-9f) { contains=true; break; }
+                        if(p.Equals(a.P)||p.Equals(b.P)||p.Equals(c.P)) continue;
+                        if(Turn(a.P,b.P,p,normal)>=-1e-12&&
+                           Turn(b.P,c.P,p,normal)>=-1e-12&&
+                           Turn(c.P,a.P,p,normal)>=-1e-12) { contains=true; break; }
                     }
                     if(contains) continue;
                     back.Triangle(a,b,c,0); front.Triangle(c,b,a,0); loop.RemoveAt(i); clipped=true; break;
@@ -502,6 +529,106 @@ namespace Wyvernland
             }
         }
 
+        static double Turn(Vector3 a,Vector3 b,Vector3 c,Vector3 normal)
+        {
+            double x=(double)b.x-a.x,y=(double)b.y-a.y,z=(double)b.z-a.z;
+            double u=(double)c.x-a.x,v=(double)c.y-a.y,w=(double)c.z-a.z;
+            return (y*w-z*v)*normal.x+(z*u-x*w)*normal.y+(x*v-y*u)*normal.z;
+        }
+        static double ContourArea(List<Vertex> loop,Vector3 normal)
+        {
+            double area=0;
+            for(int i=1;i+1<loop.Count;i++) area+=Turn(loop[0].P,loop[i].P,loop[i+1].P,normal);
+            return area;
+        }
+        static bool ContourContains(List<Vertex> loop,Vector3 point,Vector3 normal)
+        {
+            int drop=Mathf.Abs(normal.x)>=Mathf.Abs(normal.y)&&Mathf.Abs(normal.x)>=Mathf.Abs(normal.z)?0:
+                Mathf.Abs(normal.y)>=Mathf.Abs(normal.z)?1:2;
+            int x=(drop+1)%3,y=(drop+2)%3;
+            bool inside=false;
+            for(int i=0,j=loop.Count-1;i<loop.Count;j=i++)
+            {
+                Vector3 a=loop[i].P,b=loop[j].P;
+                if((a[y]>point[y])!=(b[y]>point[y])&&
+                    point[x]<(double)(b[x]-a[x])*(point[y]-a[y])/(b[y]-a[y])+a[x]) inside=!inside;
+            }
+            return inside;
+        }
+        static bool SegmentsCross(Vector3 a,Vector3 b,Vector3 c,Vector3 d,Vector3 normal)
+        {
+            if((a-c).sqrMagnitude<Epsilon*Epsilon*4f||(a-d).sqrMagnitude<Epsilon*Epsilon*4f||
+                (b-c).sqrMagnitude<Epsilon*Epsilon*4f||(b-d).sqrMagnitude<Epsilon*Epsilon*4f) return false;
+            double ac=Turn(a,b,c,normal),ad=Turn(a,b,d,normal),ca=Turn(c,d,a,normal),cb=Turn(c,d,b,normal);
+            if(ac*ad<0&&ca*cb<0) return true;
+            bool On(Vector3 p,Vector3 start,Vector3 end,double turn) =>
+                Math.Abs(turn)<1e-12&&Vector3.Dot(p-start,p-end)<=0;
+            return On(c,a,b,ac)||On(d,a,b,ad)||On(a,c,d,ca)||On(b,c,d,cb);
+        }
+        static bool BridgeHole(List<Vertex> outer,List<Vertex> hole,List<List<Vertex>> holes,Vector3 normal)
+        {
+            int outerIndex=-1,holeIndex=-1;float shortest=float.PositiveInfinity;
+            for(int h=0;h<hole.Count;h++)
+            for(int o=0;o<outer.Count;o++)
+            {
+                Vector3 a=hole[h].P,b=outer[o].P;float distance=(a-b).sqrMagnitude;
+                if(distance>=shortest) continue;
+                Vector3 middle=(a+b)*.5f;
+                if(!ContourContains(outer,middle,normal)) continue;
+                bool visible=true;
+                foreach(var contour in holes)
+                {
+                    if(ContourContains(contour,middle,normal)) { visible=false;break; }
+                    for(int i=0;i<contour.Count;i++)
+                        if(SegmentsCross(a,b,contour[i].P,contour[(i+1)%contour.Count].P,normal))
+                        { visible=false;break; }
+                    if(!visible) break;
+                }
+                for(int i=0;visible&&i<outer.Count;i++)
+                    if(SegmentsCross(a,b,outer[i].P,outer[(i+1)%outer.Count].P,normal)) visible=false;
+                if(!visible) continue;
+                shortest=distance;outerIndex=o;holeIndex=h;
+            }
+            if(outerIndex<0) return false;
+            var bridge=new List<Vertex>(hole.Count+2);
+            for(int i=0;i<=hole.Count;i++) bridge.Add(hole[(holeIndex+i)%hole.Count]);
+            bridge.Add(outer[outerIndex]);outer.InsertRange(outerIndex+1,bridge);
+            return true;
+        }
+        static void CapContours(List<List<Vertex>> contours,Vector3 normal,Builder front,Builder back)
+        {
+            // Interior contours are cavities, while disjoint contours are
+            // separate wood sections. Bridge each cavity before triangulating
+            // so caps close the shell without inventing material in its holes.
+            var parent=new int[contours.Count];var depth=new int[contours.Count];
+            for(int i=0;i<contours.Count;i++)
+            {
+                parent[i]=-1;double nearest=double.PositiveInfinity;
+                double ownArea=Math.Abs(ContourArea(contours[i],normal));
+                for(int j=0;j<contours.Count;j++)
+                {
+                    double area=Math.Abs(ContourArea(contours[j],normal));
+                    if(i==j||area<=ownArea||area>=nearest||!ContourContains(contours[j],contours[i][0].P,normal)) continue;
+                    nearest=area;parent[i]=j;
+                }
+            }
+            for(int i=0;i<contours.Count;i++)
+                for(int ancestor=parent[i];ancestor>=0;ancestor=parent[ancestor]) depth[i]++;
+            for(int i=0;i<contours.Count;i++)
+            {
+                if((depth[i]&1)!=0) continue;
+                var outer=new List<Vertex>(contours[i]);if(ContourArea(outer,normal)<0) outer.Reverse();
+                var holes=new List<List<Vertex>>();
+                for(int j=0;j<contours.Count;j++)
+                    if(parent[j]==i)
+                    {
+                        var hole=new List<Vertex>(contours[j]);if(ContourArea(hole,normal)>0) hole.Reverse();holes.Add(hole);
+                    }
+                bool bridged=true;
+                foreach(var hole in holes) bridged&=BridgeHole(outer,hole,holes,normal);
+                if(bridged) Cap(outer,normal,front,back);
+            }
+        }
         readonly struct TriangleFace
         {
             public readonly Vertex A,B,C;
@@ -530,7 +657,7 @@ namespace Wyvernland
         {
             var faces=Faces(mesh);
             float maximumEdge=radius*1.25f;
-            for(int pass=0;pass<16&&faces.Count<60000;pass++)
+            for(int pass=0;pass<16&&faces.Count<MaximumRefinedChipFaces;pass++)
             {
                 var marked=new HashSet<(Vector3,Vector3)>();
                 foreach(var f in faces)
@@ -543,6 +670,16 @@ namespace Wyvernland
                     marked.Add(largest==ab?Edge(f.A.P,f.B.P):largest==bc?Edge(f.B.P,f.C.P):Edge(f.C.P,f.A.P));
                 }
                 if(marked.Count==0) break;
+                // Count all shared-edge subdivisions before changing any face.
+                // Stopping a pass halfway would introduce open T junctions.
+                int refinedCount=faces.Count;
+                foreach(var f in faces)
+                {
+                    if(marked.Contains(Edge(f.A.P,f.B.P))) refinedCount++;
+                    if(marked.Contains(Edge(f.B.P,f.C.P))) refinedCount++;
+                    if(marked.Contains(Edge(f.C.P,f.A.P))) refinedCount++;
+                }
+                if(refinedCount>MaximumRefinedChipFaces) break;
                 var refined=new List<TriangleFace>(faces.Count*2);
                 foreach(var f in faces)
                 {
@@ -574,6 +711,103 @@ namespace Wyvernland
             return midpoint;
         }
 
+        // Test chip travel against the actual shell. Bounds alone let a cavity
+        // floor escape a tapered trunk and cross its remaining side walls.
+        sealed class ChipSolidQuery
+        {
+            sealed class Node
+            {
+                public Bounds Bounds;
+                public Node Left,Right;
+                public int Start,Count;
+            }
+            readonly List<TriangleFace> faces;
+            readonly Node root;
+            readonly Dictionary<Vector3,bool> travel=new();
+            readonly List<float> hits=new();
+            readonly Vector3 inward;
+            readonly float tolerance;
+            static readonly Vector3 ProbeDirection=new Vector3(.371f,.613f,.699f).normalized;
+            public ChipSolidQuery(Mesh mesh,Vector3 displacement)
+            {
+                faces=Faces(mesh);inward=displacement;
+                Bounds bounds=mesh.bounds;
+                float largest=Mathf.Max(Mathf.Abs(bounds.center.x),
+                    Mathf.Max(Mathf.Abs(bounds.center.y),Mathf.Abs(bounds.center.z)))+bounds.extents.magnitude;
+                tolerance=Mathf.Max(Epsilon,largest*.00000012f);
+                root=faces.Count>0?Build(0,faces.Count):null;
+            }
+            Node Build(int start,int count)
+            {
+                var node=new Node{Start=start,Count=count};
+                node.Bounds=new Bounds(faces[start].A.P,Vector3.zero);
+                for(int i=start;i<start+count;i++)
+                { node.Bounds.Encapsulate(faces[i].A.P);node.Bounds.Encapsulate(faces[i].B.P);node.Bounds.Encapsulate(faces[i].C.P); }
+                if(count<=8) return node;
+                Vector3 size=node.Bounds.size;
+                int axis=size.x>=size.y&&size.x>=size.z?0:size.y>=size.z?1:2;
+                faces.Sort(start,count,Comparer<TriangleFace>.Create((a,b)=>
+                    (a.A.P[axis]+a.B.P[axis]+a.C.P[axis]).CompareTo(b.A.P[axis]+b.B.P[axis]+b.C.P[axis])));
+                int half=count/2;
+                node.Left=Build(start,half);node.Right=Build(start+half,count-half);
+                return node;
+            }
+            void Intersections(Node node,Ray ray,float maximum)
+            {
+                if(node==null||!node.Bounds.IntersectRay(ray,out float entry)||entry>maximum) return;
+                if(node.Left!=null)
+                { Intersections(node.Left,ray,maximum);Intersections(node.Right,ray,maximum);return; }
+                for(int i=node.Start;i<node.Start+node.Count;i++)
+                {
+                    TriangleFace face=faces[i];
+                    Vector3 a=face.A.P,b=face.B.P,c=face.C.P;
+                    Vector3 ab=b-a,ac=c-a,p=Vector3.Cross(ray.direction,ac);
+                    float determinant=Vector3.Dot(ab,p);
+                    if(Mathf.Abs(determinant)<1e-12f) continue;
+                    float inverse=1f/determinant;
+                    Vector3 offset=ray.origin-a;
+                    float u=Vector3.Dot(offset,p)*inverse;
+                    if(u<-.000001f||u>1.000001f) continue;
+                    Vector3 q=Vector3.Cross(offset,ab);
+                    float v=Vector3.Dot(ray.direction,q)*inverse;
+                    if(v<-.000001f||u+v>1.000001f) continue;
+                    float distance=Vector3.Dot(ac,q)*inverse;
+                    if(distance>tolerance&&distance<maximum) hits.Add(distance);
+                }
+            }
+            bool Contains(Vector3 point)
+            {
+                hits.Clear();Intersections(root,new Ray(point,ProbeDirection),float.PositiveInfinity);
+                hits.Sort();
+                int count=0;float previous=float.NegativeInfinity;
+                foreach(float hit in hits)
+                    if(hit-previous>tolerance*2f) { count++;previous=hit; }
+                return (count&1)!=0;
+            }
+            bool TravelInside(Vector3 point)
+            {
+                if(travel.TryGetValue(point,out bool inside)) return inside;
+                float length=inward.magnitude;
+                if(length<=tolerance*4f) return travel[point]=false;
+                Vector3 direction=inward/length;
+                // The first sample establishes that travel enters the material.
+                // Any later surface crossing would leave it, even if the end
+                // point were inside another lobe of a concave shell.
+                inside=Contains(point+direction*(tolerance*4f))&&Contains(point+inward);
+                if(inside)
+                {
+                    hits.Clear();Intersections(root,new Ray(point,direction),length-tolerance);
+                    inside=hits.Count==0;
+                }
+                travel[point]=inside;
+                return inside;
+            }
+            public bool FaceInside(Vertex a,Vertex b,Vertex c) =>
+                TravelInside(a.P)&&TravelInside(b.P)&&TravelInside(c.P)&&
+                TravelInside((a.P+b.P)*.5f)&&TravelInside((b.P+c.P)*.5f)&&
+                TravelInside((c.P+a.P)*.5f)&&TravelInside((a.P+b.P+c.P)/3f);
+        }
+
         // Group neighboring faces into closed chips. Wood uses larger patches;
         // shared edges have no internal walls, while the remainder keeps its perimeter.
         public static List<Mesh> Chip(Mesh source,Vector3 point,float radius,float depth,
@@ -597,9 +831,11 @@ namespace Wyvernland
                 nearest=distance;
                 surfaceNormal=Vector3.Cross(face.B.P-face.A.P,face.C.P-face.A.P).normalized;
             }
+            if(nearest>radius) { remainder=null;return pieces; }
             Vector3 towardCenter=(source.bounds.center-point).normalized;
             Vector3 inward=(Vector3.Dot(towardCenter,surfaceNormal)<-0.05f?
                 towardCenter:-surfaceNormal)*depth;
+            ChipSolidQuery solid=null;
             foreach(var face in faces)
             {
                 var a=face.A; var b=face.B; var c=face.C; int slot=face.Slot;
@@ -612,7 +848,8 @@ namespace Wyvernland
                 // put any new vertex beyond the source mesh's own envelope.
                 if(!InsideBounds(originalBounds,a.P+inward)||
                    !InsideBounds(originalBounds,b.P+inward)||
-                   !InsideBounds(originalBounds,c.P+inward))
+                   !InsideBounds(originalBounds,c.P+inward)||
+                   !(solid??=new ChipSolidQuery(source,inward)).FaceInside(a,b,c))
                 { keep.Triangle(a,b,c,slot); continue; }
                 int index=selected.Count;
                 selected.Add(face);

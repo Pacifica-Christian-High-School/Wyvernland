@@ -26,7 +26,7 @@ namespace Wyvernland.Editor
             try
             {
                 Require(pickup.LaunchGoldenStoneCopy(camera,player.transform)==null,"Unheld stone launched");
-                pickup.PickUp(hand.transform);
+                Require(pickup.PickUp(hand.transform,true),"Golden stone needs a two-hand pickup at its material mass");
                 Physics.SyncTransforms();
                 Vector3 origin=stone.transform.position;
                 launched=pickup.LaunchGoldenStoneCopy(camera,player.transform);

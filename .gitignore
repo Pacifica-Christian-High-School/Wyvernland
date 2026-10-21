@@ -8,6 +8,9 @@
 /[Bb]uilds/
 /[Mm]emory[Cc]aptures/
 /[Rr]ecordings/
+/Sites/
+/Assets/Resources/Terrain/BrowserPitTiles.bytes
+/Assets/Resources/Terrain/BrowserPitTiles.bytes.meta
 
 # Local validation projects, exports, and backups
 /Artifacts/
@@ -15,6 +18,8 @@
 /TempDestructionCheck/
 /TempValidationProject/
 /TempValidationProject2/
+/.codex-validation/
+**/__pycache__/
 
 # Generated IDE files
 /.vs/

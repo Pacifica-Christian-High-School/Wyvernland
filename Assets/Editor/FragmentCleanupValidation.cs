@@ -9,6 +9,7 @@ namespace Wyvernland.Editor
         {
             var source=GameObject.CreatePrimitive(PrimitiveType.Cube);
             source.name="Wood cleanup source";
+            source.transform.localScale=Vector3.one*0.4f;
             var ordinary=GameObject.CreatePrimitive(PrimitiveType.Cube);
             ordinary.name="Ordinary object fragment";
             var hand=new GameObject("Cleanup validation hand");

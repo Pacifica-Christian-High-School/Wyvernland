@@ -4,7 +4,7 @@ using UnityEngine.Rendering;
 
 namespace Wyvernland
 {
-    /// <summary>Streams deterministic low-poly rocks, stones and nearby piles.</summary>
+    /// <summary>Generates permanently loaded deterministic rocks, stones and piles.</summary>
     public sealed class ProceduralRockField : MonoBehaviour
     {
         private const float StonePilePopulationScale = 0.35f;
@@ -19,9 +19,7 @@ namespace Wyvernland
             public bool IsRockPile;
             public GameObject Instance;
             public Mesh Mesh;
-            public Mesh DistantMesh;
             public MeshFilter Filter;
-            public bool Distant;
             public readonly List<Collider> Colliders=new();
             public readonly List<Mesh> ChildMeshes=new();
             public readonly List<MeshRenderer> ChildRenderers=new();
@@ -37,14 +35,14 @@ namespace Wyvernland
         private Material pileVertexMaterial;
         private Transform observer;
         private ProceduralMap map;
-        private WorldObjectStreaming streaming;
-        private float nextRefresh;
+        private readonly List<(Mesh mesh,Matrix4x4 placement)> terrainPits=new();
+        private int preparedTerrainPits;
+        private bool terrainPitsReady;
 
-        public void Initialize(FirstPersonController player,ProceduralMap terrain)
+        public void Initialize(FirstPersonController player,ProceduralMap terrain,bool deferCreation=false)
         {
             observer=player.transform;
             map=terrain;
-            streaming=FindFirstObjectByType<WorldObjectStreaming>();
             Shader shader=Resources.Load<Shader>("Clay");
             if (shader==null) throw new System.InvalidOperationException("Missing clay shader.");
             for (int i=0;i<10;i++)
@@ -80,7 +78,7 @@ namespace Wyvernland
                 entries.Add(new Entry { Seed = new GroundFeatureSeed { Position = new Vector2(-20,rowZ),
                     Size = 0.8f, Seed = 433, Kind = GroundFeatureKind.IndividualStone } });
                 entries.Add(new Entry { Seed = rock, IsRockPile = true });
-                Refresh();
+                if(!deferCreation) { Refresh(); PreloadTerrainPits(); }
                 return;
             }
             foreach (GroundFeatureSeed seed in GroundFeatureLayout.Features)
@@ -96,7 +94,66 @@ namespace Wyvernland
                     seed.RockPilePosition.x,seed.RockPilePosition.y,3f+seed.RockPileRadius))
                     entries.Add(new Entry { Seed=seed,IsRockPile=true });
             }
-            Refresh();
+            if(!deferCreation) { Refresh(); PreloadTerrainPits(); }
+        }
+
+        internal System.Collections.IEnumerator InitializeIncrementally(FirstPersonController player,ProceduralMap terrain,
+            System.Action<int,int> progress=null)
+        {
+            Initialize(player,terrain,true);
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            int done=0;
+            foreach(Entry entry in entries)
+            {
+                if(entry.Instance==null) Create(entry);
+                done++;
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { progress?.Invoke(done,entries.Count);yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            progress?.Invoke(done,entries.Count);
+        }
+
+        private void PreloadTerrainPits()
+        {
+            var routine=PreloadTerrainPitsIncrementally();
+            while(routine.MoveNext()) { }
+        }
+
+        internal System.Collections.IEnumerator PreloadTerrainPitsIncrementally(
+            System.Action<int,int> progress=null)
+        {
+            if(terrainPitsReady) yield break;
+#if UNITY_WEBGL && !UNITY_EDITOR
+            if(!WorldBootstrap.TestGround)
+            {
+                var cached=map.LoadBrowserPitTilesIncrementally();
+                while(cached.MoveNext()) yield return cached.Current;
+                preparedTerrainPits=terrainPits.Count;terrainPitsReady=true;
+                yield break;
+            }
+#endif
+            map.BeginStonePitGeneration();
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            while(preparedTerrainPits<terrainPits.Count)
+            {
+                var pit=terrainPits[preparedTerrainPits];
+                Mesh cutter=StoneTerrainCutout.SimplifyCutter(pit.mesh);
+                try { map.CarveStoneTerrain(cutter,pit.placement); }
+                finally { DestroyGenerated(cutter); }
+                preparedTerrainPits++;
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { progress?.Invoke(preparedTerrainPits,terrainPits.Count);yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            progress?.Invoke(preparedTerrainPits,terrainPits.Count);
+            var finish=map.FinishStonePitGenerationIncrementally();
+            while(finish.MoveNext()) yield return finish.Current;
+            terrainPitsReady=true;
+        }
+
+        private void QueueTerrainPit(Mesh mesh,Transform placement)
+        {
+            terrainPits.Add((mesh,placement.localToWorldMatrix));
+            terrainPitsReady=false;
         }
 
         private bool SampleOriginalSurface(Entry entry,float x,float z,out RaycastHit hit)
@@ -123,70 +180,9 @@ namespace Wyvernland
         private static Color RemoveTerrainBlend(Color color) =>
             Color.LerpUnclamped(WorldConfig.GroundColor,color,1f/TerrainColorBlend);
 
-        private void Update()
-        {
-            if (Time.unscaledTime<nextRefresh) return;
-            nextRefresh=Time.unscaledTime+0.25f;
-            Refresh();
-        }
-
         private void Refresh()
         {
-            if (observer==null) return;
-            float range=streaming!=null?streaming.LoadingRange:500f;
-            float physicsSquared=range*range,visibleSquared=physicsSquared*4f;
-            int budget=10;
-            foreach (Entry entry in entries)
-            {
-                if(entry.PhysicallyModified) continue;
-                bool containsMovedStone=entry.Instance!=null&&
-                    entry.Instance.TryGetComponent<PickableObject>(out PickableObject pickable)&&pickable.HasBeenPickedUp;
-                if(!containsMovedStone)
-                    foreach(PickableObject pileStone in entry.Pickables)
-                        if(pileStone!=null&&pileStone.HasBeenPickedUp) { containsMovedStone=true; break; }
-                bool containsMovingObject=HasVelocity(entry.Instance);
-                if(!containsMovingObject)
-                    foreach(PickableObject pileStone in entry.Pickables)
-                        if(pileStone!=null&&HasVelocity(pileStone.gameObject))
-                        { containsMovingObject=true; break; }
-                // Collected stones now live in the hand or in world physics, independent of their spawn.                
-                if(containsMovedStone||containsMovingObject) continue;
-                Vector2 delta=entry.Position-new Vector2(observer.position.x,observer.position.z);
-                float distance=delta.sqrMagnitude;
-                if (distance>visibleSquared)
-                {
-                    if (entry.Instance!=null) Release(entry);
-                    continue;
-                }
-                if (entry.Instance==null&&budget-->0) Create(entry);
-                bool useDistantMesh=distance>physicsSquared;
-                if(entry.Filter!=null&&entry.Distant!=useDistantMesh)
-                {
-                    entry.Filter.sharedMesh=useDistantMesh?entry.DistantMesh:entry.Mesh;
-                    if(entry.IsRockPile)
-                    {
-                        entry.Instance.GetComponent<MeshRenderer>().enabled=useDistantMesh;
-                        foreach(MeshRenderer child in entry.ChildRenderers)
-                            if(child!=null) child.enabled=!useDistantMesh;
-                    }
-                    entry.Distant=useDistantMesh;
-                }
-                foreach(Collider collider in entry.Colliders)
-                {
-                    if(collider==null) continue;
-                    PickableObject colliderStone=collider.GetComponent<PickableObject>();
-                    if((colliderStone==null||!colliderStone.HasBeenPickedUp)&&
-                        collider.enabled!=(distance<=physicsSquared))
-                        collider.enabled=distance<=physicsSquared;
-                }
-            }
-        }
-
-        private static bool HasVelocity(GameObject target)
-        {
-            if(target==null) return false;
-            Rigidbody body=target.GetComponent<Rigidbody>();
-            return body!=null&&body.linearVelocity.sqrMagnitude>0f;
+            foreach(Entry entry in entries) if(entry.Instance==null) Create(entry);
         }
 
         private static float StoneBurialFraction(float size)
@@ -245,7 +241,6 @@ namespace Wyvernland
                     rockBuilder.SetColor(BlendWithTerrain(pileColor));
                     rockBuilder.AddStandingRock(rockSize,random);
                     Mesh rockMesh=rockBuilder.Build("Low-poly pile rock");
-                    builder.AddMesh(rockMesh,centre,orient);
                     Vector3 pivot=DestructionMesh.VolumeCentroid(rockMesh);
                     Vector3[] vertices=rockMesh.vertices;
                     for(int v=0;v<vertices.Length;v++) vertices[v]-=pivot;
@@ -343,7 +338,7 @@ namespace Wyvernland
                     Quaternion.AngleAxis(Next(0f,360f),Vector3.up);
                 builder.AddStandingRock(entry.Seed.Size,random);
             }
-            if(builder.VertexCount==0&&pileStones.Count==0) return;
+            if(builder.VertexCount==0&&pileStones.Count==0&&pileRocks.Count==0) return;
             if(entry.IsPile)
             {
                 entry.Instance=new GameObject("Low-poly stone pile");
@@ -370,26 +365,17 @@ namespace Wyvernland
                     PickableObject pilePickable=stone.AddComponent<PickableObject>();
                     pilePickable.DisplayName="Stone";
                     pilePickable.Label=PickableObjectLabel.Irregular;
-                    pilePickable.ConfigureStonePit(map,stoneMesh,stone.transform);
+                    QueueTerrainPit(stoneMesh,stone.transform);
                     entry.Pickables.Add(pilePickable);
                 }
                 return;
             }
             if(entry.IsRockPile)
             {
-                entry.Mesh=builder.Build("Low-poly rock pile");
-                entry.DistantMesh=MeshFaceReduction.Create(entry.Mesh,0.2f,
-                    "Distant rock pile");
                 entry.Instance=new GameObject("Low-poly rock pile");
                 entry.Instance.transform.SetParent(transform,false);
                 entry.Instance.transform.SetPositionAndRotation(position,Quaternion.identity);
                 entry.Instance.AddComponent<GeneratedGroundFeature>();
-                entry.Filter=entry.Instance.AddComponent<MeshFilter>();
-                entry.Filter.sharedMesh=entry.Mesh;
-                MeshRenderer distantRenderer=entry.Instance.AddComponent<MeshRenderer>();
-                distantRenderer.sharedMaterial=pileVertexMaterial;
-                distantRenderer.shadowCastingMode=ShadowCastingMode.On;
-                distantRenderer.enabled=false;
                 for(int i=0;i<pileRocks.Count;i++)
                 {
                     (Vector3 centre,Quaternion rockRotation,Mesh rockMesh)=pileRocks[i];
@@ -404,8 +390,7 @@ namespace Wyvernland
                     rockCollider.sharedMesh=rockMesh;
                     PhysicalDestructible properties=PhysicalDestructible.Ensure(rock);
                     properties.GeometryChanged+=()=>entry.PhysicallyModified=true;
-                    CarveTerrainOnFirstDestruction(properties,rockMesh,
-                        rock.transform.localToWorldMatrix);
+                    QueueTerrainPit(rockMesh,rock.transform);
                     entry.ChildMeshes.Add(rockMesh);
                     entry.ChildRenderers.Add(rockRenderer);
                     entry.Colliders.Add(rockCollider);
@@ -423,7 +408,6 @@ namespace Wyvernland
                     (1f-2f*burial));
             }
             entry.Mesh=generatedMesh;
-            entry.DistantMesh=MeshFaceReduction.Create(entry.Mesh,0.2f,"Distant ground feature");
             entry.Instance=new GameObject(entry.Mesh.name);
             entry.Instance.transform.SetParent(transform,false);
             entry.Instance.transform.SetPositionAndRotation(position,rotation);
@@ -432,9 +416,7 @@ namespace Wyvernland
             entry.Filter.sharedMesh=entry.Mesh;
             PhysicalDestructible feature=PhysicalDestructible.Ensure(entry.Instance);
             feature.GeometryChanged+=()=>entry.PhysicallyModified=true;
-            if(!isStone)
-                CarveTerrainOnFirstDestruction(feature,entry.Mesh,
-                    entry.Instance.transform.localToWorldMatrix);
+            QueueTerrainPit(entry.Mesh,entry.Instance.transform);
             MeshRenderer renderer=entry.Instance.AddComponent<MeshRenderer>();
             List<Material> palette=isStone?stoneMaterials:rockMaterials;
             renderer.sharedMaterial=entry.IsPile||entry.IsRockPile?
@@ -459,29 +441,14 @@ namespace Wyvernland
                 PickableObject stone=entry.Instance.AddComponent<PickableObject>();
                 stone.DisplayName="Stone";
                 stone.Label=PickableObjectLabel.Irregular;
-                stone.ConfigureStonePit(map,entry.Mesh,entry.Instance.transform);
             }
-        }
-
-        private void CarveTerrainOnFirstDestruction(PhysicalDestructible rock,
-            Mesh originalMesh,Matrix4x4 originalPlacement)
-        {
-            bool carved=false;
-            rock.GeometryChanged+=() =>
-            {
-                if(carved||map==null||originalMesh==null) return;
-                carved=true;
-                Mesh cutter=StoneTerrainCutout.SimplifyCutter(originalMesh);
-                try { map.CarvePickedUpStone(cutter,originalPlacement); }
-                finally { DestroyGenerated(cutter); }
-            };
         }
 
         private void Release(Entry entry)
         {
             entry.Instance.SetActive(false);
-            DestroyGenerated(entry.Instance); DestroyGenerated(entry.Mesh); DestroyGenerated(entry.DistantMesh);
-            entry.Instance=null; entry.Mesh=null; entry.DistantMesh=null;
+            DestroyGenerated(entry.Instance); DestroyGenerated(entry.Mesh);
+            entry.Instance=null; entry.Mesh=null;
             foreach(Mesh childMesh in entry.ChildMeshes) if(childMesh!=null) DestroyGenerated(childMesh);
             entry.Filter=null; entry.Colliders.Clear();entry.ChildMeshes.Clear();
             entry.ChildRenderers.Clear();entry.Pickables.Clear();
@@ -509,7 +476,10 @@ namespace Wyvernland
             private readonly List<Color> colors=new();
             private Color currentColor=Color.white;
             public int VertexCount=>vertices.Count;
-            public void SetColor(Color color)=>currentColor=color;
+            // Mesh colors are consumed directly in linear space, unlike
+            // material Color properties which Unity converts for us.
+            public void SetColor(Color color)=>currentColor=
+                QualitySettings.activeColorSpace==ColorSpace.Linear?color.linear:color;
 
             private void Face(Vector3 a,Vector3 b,Vector3 c)
             {
@@ -664,15 +634,12 @@ namespace Wyvernland
         private readonly List<MonumentSeed> monuments=new();
         private readonly List<Material> materials=new();
         private Transform observer;
-        private WorldObjectStreaming streaming;
         private GameObject monumentPrefab;
-        private float nextRefresh;
 
         public void Initialize(FirstPersonController player,ProceduralMap map)
         {
             interiors.Clear();
             observer=player.transform;
-            streaming=FindFirstObjectByType<WorldObjectStreaming>();
             monumentPrefab=Resources.Load<GameObject>("Models/AncientMonument");
             if(monumentPrefab==null)
                 throw new System.InvalidOperationException(
@@ -726,29 +693,10 @@ namespace Wyvernland
             Refresh();
         }
 
-        private void Update()
-        {
-            if(Time.unscaledTime<nextRefresh) return;
-            nextRefresh=Time.unscaledTime+0.4f;
-            Refresh();
-        }
-
         private void Refresh()
         {
-            if(observer==null) return;
-            float range=streaming!=null?streaming.LoadingRange:500f;
-            float physics=range*range;
             foreach(MonumentSeed monument in monuments)
-            {
-                if(monument.PhysicallyModified) continue;
-                float distance=(monument.Position-observer.position).sqrMagnitude;
-                // Monument silhouettes remain visible across the entire world;
-                // only their expensive collision follows Graphic Loading Range.
                 if(monument.Instance==null) Create(monument);
-                if(monument.Colliders!=null)
-                    foreach(MeshCollider collider in monument.Colliders)
-                        if(collider!=null) collider.enabled=distance<=physics;
-            }
         }
 
         private void Create(MonumentSeed monument)

@@ -4,23 +4,20 @@ using UnityEngine.InputSystem;
 
 namespace Wyvernland
 {
-    // Keeps only lightweight tree seeds outside the visible radius. Other scene
-    // objects retain their state while inactive so scripts and physics can resume.
-    public sealed class WorldObjectStreaming : MonoBehaviour
+    // Generates the complete resident tree population once at world creation.
+    public sealed class ProceduralTreeField : MonoBehaviour
     {
-        public float LoadingRange { get; private set; }
         private Transform observer;
         private FirstPersonController playerController;
         private ProceduralMap map;
-        private readonly List<TreeSeed> trees = new();
+        private readonly List<TreeSeed> trees=new();
         private readonly Queue<TreeSeed> midpointBreakQueue=new();
         private float nextMidpointBreakTime;
-        private readonly Dictionary<Vector2Int,List<Vector2>> treeGrassCells = new();
-        private readonly List<TrackedObject> objects = new();
-        private readonly HashSet<GameObject> registered = new();
-        private readonly List<Material> materials = new();
+        private readonly Dictionary<Vector2Int,List<Vector2>> treeGrassCells=new();
+        private readonly List<Material> materials=new();
         private Material darkWoodMaterial;
-        private float nextDiscovery;
+        private Material blackResinMaterial;
+        private Mesh blackResinMesh;
 
         // Centre lines of the blue brush strokes in 3qr3d.png. Density reaches
         // zero at each brush edge and rises smoothly toward its centre. Overlaps
@@ -93,6 +90,8 @@ namespace Wyvernland
             public Vector3 position;
             public Vector3 terrainNormal;
             public int seed;
+            public float heightOverride;
+            public float height;
             public bool woodland;
             public bool darkWood;
             public GameObject instance;
@@ -102,94 +101,20 @@ namespace Wyvernland
             public readonly List<Mesh> branchMeshes=new();
             public readonly List<int> branchParents=new();
             public int trunkSections;
-            public Mesh distantMesh;
-            public MeshFilter filter;
-            public MeshRenderer distantRenderer;
             public readonly List<MeshRenderer> nearRenderers=new();
             public readonly List<MeshCollider> nearColliders=new();
             public readonly Dictionary<string,float> wornHardness=new();
-            public bool distant;
         }
 
-        private sealed class TrackedObject
-        {
-            public GameObject root;
-            public Collider[] colliders;
-            public bool[] enabled;
-            public Rigidbody body;
-            public bool kinematic, collisions, suspended, hidden;
-            public Vector3 velocity, angularVelocity;
-
-            public void RefreshPhysicsComponents()
-            {
-                Rigidbody currentBody=root!=null?root.GetComponent<Rigidbody>():null;
-                if(currentBody==body&&colliders!=null&&
-                    System.Array.TrueForAll(colliders,collider=>collider!=null)) return;
-                body=currentBody;
-                colliders=body!=null?root.GetComponentsInChildren<Collider>(true):
-                    root.GetComponents<Collider>();
-                enabled=new bool[colliders.Length];
-                for(int i=0;i<colliders.Length;i++) enabled[i]=colliders[i].enabled;
-                suspended=false;
-            }
-
-            public bool IsMoving
-            {
-                get
-                {
-                    if(body==null) return false;
-                    Vector3 currentVelocity=suspended?velocity:body.linearVelocity;
-                    return currentVelocity.sqrMagnitude>0f;
-                }
-            }
-
-            public void PhysicsActive(bool active)
-            {
-                if (suspended == !active) return;
-                if (!active)
-                {
-                    for (int i = 0; i < colliders.Length; i++)
-                        if (colliders[i] != null) { enabled[i] = colliders[i].enabled; colliders[i].enabled = false; }
-                    if (body != null)
-                    {
-                        kinematic = body.isKinematic;
-                        collisions = body.detectCollisions;
-                        velocity = body.linearVelocity;
-                        angularVelocity = body.angularVelocity;
-                        body.Sleep();
-                        body.isKinematic = true;
-                        body.detectCollisions = false;
-                    }
-                }
-                else
-                {
-                    for (int i = 0; i < colliders.Length; i++)
-                        if (colliders[i] != null) colliders[i].enabled = enabled[i];
-                    if (body != null)
-                    {
-                        body.isKinematic = kinematic;
-                        body.detectCollisions = collisions;
-                        if (!kinematic)
-                        {
-                            body.linearVelocity = velocity;
-                            body.angularVelocity = angularVelocity;
-                            body.WakeUp();
-                        }
-                    }
-                }
-                suspended = !active;
-            }
-        }
-
-        public void Initialize(FirstPersonController player, ProceduralMap terrain)
+        public void Initialize(FirstPersonController player, ProceduralMap terrain,bool deferCreation=false)
         {
             playerController=player;
             observer = player.transform;
             map = terrain;
-            LoadingRange = Mathf.Clamp(PlayerPrefs.GetFloat("Options.LoadingRange", 500f), 50f, 3000f);
             Shader shader = Resources.Load<Shader>("Clay");
             darkWoodMaterial=new Material(shader){name="Very dark brown woodland"};
             darkWoodMaterial.SetColor("_BaseColor",EnvironmentRegions.DarkBrown);
+            EnsureBlackResinAssets();
             for (int i = 0; i < 12; i++)
             {
                 Material material = new(shader) { name = $"Tree brown {i}" };
@@ -212,6 +137,20 @@ namespace Wyvernland
                     CreateTree(tree);
                     tree.instance.name = names[i];
                 }
+                // A second row shows two full trees at deliberately different heights.
+                float[] sampleHeights = { 7f, 16f };
+                int[] sampleSeeds = { 103, 109 };
+                string[] sampleNames = { "Short Tree", "Tall Tree" };
+                for (int i = 0; i < sampleHeights.Length; i++)
+                {
+                    TreeSeed tree = new() { position = new Vector3(i*20,0,45),
+                        terrainNormal = Vector3.up, seed = sampleSeeds[i],
+                        heightOverride = sampleHeights[i] };
+                    trees.Add(tree);
+                    CreateTree(tree);
+                    tree.instance.name = sampleNames[i];
+                }
+                ConfigureTrunkBreakThresholds();
                 return;
             }
             void PlaceTrees(float spacing, float probability, bool woodland, int randomSeed,bool darkWood=false)
@@ -250,7 +189,24 @@ namespace Wyvernland
             PlaceTrees(45f,0.31f,false,74129);
             PlaceTrees(27f,0.78f,true,91357);
             PlaceTrees(24f,0.88f,true,824613,true);
-            Refresh();
+            if(!deferCreation) Refresh();
+        }
+
+        internal System.Collections.IEnumerator InitializeIncrementally(FirstPersonController player,ProceduralMap terrain,
+            System.Action<int,int> progress=null)
+        {
+            Initialize(player,terrain,true);
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
+            int done=0;
+            foreach(TreeSeed tree in trees)
+            {
+                if(tree.instance==null) CreateTree(tree);
+                done++;
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { progress?.Invoke(done,trees.Count);yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
+            ConfigureTrunkBreakThresholds();
+            progress?.Invoke(done,trees.Count);
         }
 
         private static float ForestDensity(float worldX, float worldZ)
@@ -295,28 +251,12 @@ namespace Wyvernland
             return density;
         }
 
-        public void SetRange(float value)
-        {
-            LoadingRange = Mathf.Clamp(value, 50f, 3000f);
-            PlayerPrefs.SetFloat("Options.LoadingRange", LoadingRange);
-            Refresh();
-        }
-
-        // Before the next physics step, including after loading a saved position.
-        private void FixedUpdate() => Refresh();
         private void Update()
         {
-            if (observer == null) return;
+            if(observer==null) return;
             if(playerController!=null&&!playerController.IsPaused&&
                 Keyboard.current?.lKey.wasPressedThisFrame==true)
                 RequestBreakAllTreesAtMidpoint();
-            if (Time.unscaledTime >= nextDiscovery)
-            {
-                DiscoverObjects();
-                nextDiscovery = Time.unscaledTime + 1f;
-                Refresh();
-            }
-            else if (Time.timeScale == 0f) Refresh();
             ProcessMidpointBreak();
         }
 
@@ -333,8 +273,7 @@ namespace Wyvernland
         private void QueueMidpointBreak(TreeSeed tree)
         {
             if(observer==null||tree.instance==null||tree.queuedForMidpointBreak||
-                !tree.breakAtMidpoint||tree.midpointBreakAttempts>=3||
-                (tree.position-observer.position).sqrMagnitude>LoadingRange*LoadingRange)
+                !tree.breakAtMidpoint||tree.midpointBreakAttempts>=3)
                 return;
             tree.queuedForMidpointBreak=true;
             midpointBreakQueue.Enqueue(tree);
@@ -347,20 +286,12 @@ namespace Wyvernland
             nextMidpointBreakTime=Time.unscaledTime+0.1f;
             TreeSeed tree=midpointBreakQueue.Dequeue();
             tree.queuedForMidpointBreak=false;
-            if(!tree.breakAtMidpoint||tree.instance==null||
-                (tree.position-observer.position).sqrMagnitude>LoadingRange*LoadingRange)
+            if(!tree.breakAtMidpoint||tree.instance==null)
                 return;
             tree.midpointBreakAttempts++;
             GeneratedTree generated=tree.instance.GetComponent<GeneratedTree>();
-            if(tree.distant)
-            {
-                tree.distantRenderer.enabled=false;
-                foreach(var renderer in tree.nearRenderers)
-                    if(renderer!=null) renderer.enabled=true;
-                foreach(var collider in tree.nearColliders)
-                    if(collider!=null) collider.enabled=true;
-                tree.distant=false;
-            }
+            foreach(var collider in tree.nearColliders)
+                if(collider!=null) collider.enabled=true;
             if(generated!=null&&generated.BreakAtMidpoint())
             {
                 tree.breakAtMidpoint=false;
@@ -368,110 +299,38 @@ namespace Wyvernland
             }
         }
 
-        private void DiscoverObjects()
+        private void Refresh()
         {
-            foreach (Collider collider in FindObjectsByType<Collider>(FindObjectsSortMode.None))
-            {
-                if (map.IsMapCollider(collider) || collider.transform.IsChildOf(observer) ||
-                    collider.GetComponentInParent<GeneratedTree>() != null ||
-                    collider.GetComponentInParent<GeneratedGroundFeature>() != null) continue;
-                GameObject root = collider.attachedRigidbody != null ? collider.attachedRigidbody.gameObject : collider.gameObject;
-                // Never deactivate an ancestor containing the terrain or player.
-                if (observer.IsChildOf(root.transform) || map.transform.IsChildOf(root.transform) || !registered.Add(root)) continue;
-                Collider[] colliders = collider.attachedRigidbody != null ? root.GetComponentsInChildren<Collider>() : root.GetComponents<Collider>();
-                objects.Add(new TrackedObject { root = root, colliders = colliders,
-                    enabled = new bool[colliders.Length], body = collider.attachedRigidbody });
-            }
+            foreach(TreeSeed tree in trees) if(tree.instance==null) CreateTree(tree);
+            ConfigureTrunkBreakThresholds();
         }
 
-        private int treeCreationFrame=-1;
-        private int treesCreatedThisFrame;
-        public void Refresh()
+        private void ConfigureTrunkBreakThresholds()
         {
-            if (observer == null) return;
-            if(treeCreationFrame!=Time.frameCount)
-            { treeCreationFrame=Time.frameCount; treesCreatedThisFrame=0; }
-            float physicsSquared = LoadingRange * LoadingRange;
-            float visibleSquared = physicsSquared * 4f;
-            foreach (TreeSeed tree in trees)
-            {
-                float distance = (tree.position - observer.position).sqrMagnitude;
-                if(tree.breakAtMidpoint) QueueMidpointBreak(tree);
-                if(tree.physicallyModified)
+            float minimum=float.PositiveInfinity,maximum=float.NegativeInfinity;
+            foreach(TreeSeed tree in trees)
+                if(tree.instance!=null&&tree.instance.TryGetComponent<GeneratedTree>(out var generated))
                 {
-                    if(tree.instance!=null)
-                    {
-                        bool visible=distance<=visibleSquared;
-                        if(tree.instance.activeSelf!=visible) tree.instance.SetActive(visible);
-                        foreach(var collider in tree.nearColliders)
-                            if(collider!=null&&collider.transform.IsChildOf(tree.instance.transform))
-                                collider.enabled=visible&&distance<=physicsSquared;
-                    }
-                    continue;
+                    minimum=Mathf.Min(minimum,generated.AverageTrunkRadius);
+                    maximum=Mathf.Max(maximum,generated.AverageTrunkRadius);
                 }
-                if (distance > visibleSquared)
-                {
-                    if (tree.instance != null)
-                    {
-                        tree.instance.SetActive(false);
-                        Destroy(tree.instance); ReleaseTreeMeshes(tree);
-                        tree.instance=null; tree.filter=null; tree.distantRenderer=null;
-                        tree.nearRenderers.Clear(); tree.nearColliders.Clear();
-                    }
-                    continue;
-                }
-                // Budget mesh creation to avoid a large frame spike at startup.
-                if (tree.instance == null && treesCreatedThisFrame < 12)
-                {
-                    CreateTree(tree); treesCreatedThisFrame++;
-                }
-                bool useDistantMesh=distance>physicsSquared;
-                if(tree.filter!=null&&tree.distant!=useDistantMesh)
-                {
-                    tree.distantRenderer.enabled=useDistantMesh;
-                    foreach(var renderer in tree.nearRenderers)
-                        if(renderer!=null) renderer.enabled=!useDistantMesh;
-                    tree.distant=useDistantMesh;
-                }
-                foreach(var collider in tree.nearColliders)
-                    if(collider!=null&&collider.enabled!=(distance<=physicsSquared))
-                        collider.enabled=distance<=physicsSquared;
-                if(tree.breakAtMidpoint) QueueMidpointBreak(tree);
-            }
-            foreach (TrackedObject item in objects)
-            {
-                if (item.root == null) continue;
-                var destruction=item.root.GetComponentInParent<PhysicalDestructible>();
-                if(destruction!=null&&destruction.HasBeenModified) continue;
-                if (!item.hidden && !item.root.activeInHierarchy) continue;
-                item.RefreshPhysicsComponents();
-                float distance = (item.root.transform.position - observer.position).sqrMagnitude;
-                bool moving=item.IsMoving;
-                bool visible = moving||distance <= visibleSquared;
-                if (visible && item.hidden) { item.root.SetActive(true); item.hidden = false; }
-                item.PhysicsActive(moving||distance <= physicsSquared);
-                if (!visible && !item.hidden) { item.root.SetActive(false); item.hidden = true; }
-            }
+            foreach(TreeSeed tree in trees)
+                if(tree.instance!=null&&tree.instance.TryGetComponent<GeneratedTree>(out var generated))
+                    generated.ConfigureRadiusRange(minimum,maximum);
         }
 
         private void CreateTree(TreeSeed tree)
         {
             tree.mesh=GenerateTreeMesh(tree.seed,tree.woodland,tree.terrainNormal,
                 tree.darkWood,tree.branchMeshes,out tree.trunkMesh,out tree.trunkSections,
-                tree.branchParents,tree.trunkPartMeshes);
-            tree.distant=false;
-            tree.distantMesh=MeshFaceReduction.Create(tree.mesh,0.2f,"Distant tree");
+                tree.branchParents,tree.trunkPartMeshes,tree.heightOverride);
+            tree.height=tree.mesh.bounds.size.y;
             tree.instance = new GameObject(!tree.woodland&&IsStump(tree.seed) ? "Procedural Stump" :
                 tree.woodland ? "Woodland Tree" : "Procedural Tree");
             tree.instance.transform.SetParent(transform, false);
             tree.instance.transform.position = tree.position;
             var generatedTree=tree.instance.AddComponent<GeneratedTree>();
-            tree.filter=tree.instance.AddComponent<MeshFilter>();
-            tree.filter.sharedMesh=tree.distantMesh;
             Material bark=tree.darkWood?darkWoodMaterial:materials[tree.seed % materials.Count];
-            tree.distantRenderer=tree.instance.AddComponent<MeshRenderer>();
-            tree.distantRenderer.sharedMaterial=bark;
-            tree.distantRenderer.enabled=false;
             var trunkParts=new List<TreeStructuralPart>();
             var branchParts=new List<TreeStructuralPart>();
             TreeStructuralPart Part(string partName,Mesh mesh)
@@ -527,8 +386,7 @@ namespace Wyvernland
                 Bounds bounds=tree.trunkPartMeshes[i].bounds;
                 radiusSum+=(bounds.extents.x+bounds.extents.z)*0.5f;
             }
-            generatedTree.Configure(radiusSum/Mathf.Max(1,tree.trunkSections),
-                4+tree.seed%7);
+            generatedTree.Configure(radiusSum/Mathf.Max(1,tree.trunkSections),3);
             for(int i=0;i<tree.branchMeshes.Count;i++)
             {
                 var branch=Part($"Wood branch {i+1}",tree.branchMeshes[i]);
@@ -557,20 +415,140 @@ namespace Wyvernland
                     if(nearest!=null) branchParts[i].AttachTo(nearest);
                 }
             }
+            AddBlackResinGrowths(tree,trunkParts);
+            if(WorldBootstrap.TestGround&&tree.trunkSections>2)
+                generatedTree.ShowBreakingPointAtMidpoint();
+            // The old combined distant visual is no longer used. Physical parts
+            // own the resident geometry; discard these temporary assembly copies.
+            ReleaseMesh(tree.mesh);
+            tree.mesh=null;
+            if(tree.trunkMesh!=null&&!tree.trunkPartMeshes.Contains(tree.trunkMesh))
+                ReleaseMesh(tree.trunkMesh);
+            tree.trunkMesh=null;
+        }
+
+        private readonly struct ResinFace
+        {
+            public readonly TreeStructuralPart Part;
+            public readonly Vector3 Point;
+            public readonly Vector3 Normal;
+            public ResinFace(TreeStructuralPart part,Vector3 point,Vector3 normal)
+            { Part=part; Point=point; Normal=normal; }
+        }
+
+        private void AddBlackResinGrowths(TreeSeed tree,List<TreeStructuralPart> trunkParts)
+        {
+            if(tree.darkWood||!tree.woodland&&IsStump(tree.seed)||
+                tree.mesh==null||tree.trunkSections==0) return;
+            float height=tree.mesh.bounds.size.y;
+            int maximum=height<10f?1:height<24f?2:3;
+            var random=new System.Random(unchecked(tree.seed*486187739^0x4b1d5e47));
+            int count=random.Next(maximum+1);
+            if(count==0) return;
+            EnsureBlackResinAssets();
+            var faces=new List<ResinFace>();
+            for(int section=0;section<tree.trunkSections;section++)
+            {
+                Mesh mesh=tree.trunkPartMeshes[section];
+                Vector3[] vertices=mesh.vertices;
+                int[] triangles=mesh.triangles;
+                for(int index=0;index+2<triangles.Length;index+=3)
+                {
+                    Vector3 a=vertices[triangles[index]];
+                    Vector3 b=vertices[triangles[index+1]];
+                    Vector3 c=vertices[triangles[index+2]];
+                    Vector3 normal=Vector3.Cross(b-a,c-a).normalized;
+                    if(normal.sqrMagnitude<0.5f||Mathf.Abs(normal.y)>0.8f) continue;
+                    faces.Add(new ResinFace(trunkParts[section],(a+b+c)/3f,normal));
+                }
+            }
+            if(faces.Count==0) return;
+            for(int growth=0;growth<count;growth++)
+            {
+                float band=(growth+0.35f+0.3f*(float)random.NextDouble())/count;
+                float targetY=tree.mesh.bounds.min.y+height*Mathf.Lerp(0.18f,0.74f,band);
+                ResinFace chosen=faces[0];
+                float best=float.PositiveInfinity;
+                foreach(ResinFace face in faces)
+                {
+                    float score=Mathf.Abs(face.Point.y-targetY)+
+                        height*0.04f*(float)random.NextDouble();
+                    if(score>=best) continue;
+                    best=score;
+                    chosen=face;
+                }
+                float width=Mathf.Clamp(height*0.014f,0.11f,0.42f)*
+                    Mathf.Lerp(0.8f,1.2f,(float)random.NextDouble());
+                float depth=width*Mathf.Lerp(0.48f,0.68f,(float)random.NextDouble());
+                var resin=new GameObject($"Black Resin {growth+1}");
+                resin.transform.SetParent(chosen.Part.transform,false);
+                resin.transform.localPosition=chosen.Point+chosen.Normal*depth*0.15f;
+                resin.transform.localRotation=Quaternion.LookRotation(chosen.Normal,Vector3.up)*
+                    Quaternion.Euler(0f,0f,Mathf.Lerp(-25f,25f,(float)random.NextDouble()));
+                resin.transform.localScale=new Vector3(width,
+                    width*Mathf.Lerp(1.3f,1.9f,(float)random.NextDouble()),depth);
+                resin.AddComponent<MeshFilter>().sharedMesh=blackResinMesh;
+                resin.AddComponent<MeshRenderer>().sharedMaterial=blackResinMaterial;
+                MeshCollider collider=resin.AddComponent<MeshCollider>();
+                collider.sharedMesh=blackResinMesh;
+                collider.convex=true;
+                tree.nearColliders.Add(collider);
+                resin.AddComponent<PhysicalDestructible>().ApplyMaterial("Black Resin");
+                resin.AddComponent<PickableObject>().DisplayName="Black Resin";
+                resin.AddComponent<TreeResinGrowth>().Initialize(tree.instance.transform,
+                    ()=>tree.physicallyModified=true);
+            }
+        }
+
+        private void EnsureBlackResinAssets()
+        {
+            if(blackResinMaterial==null)
+            {
+                Shader shader=Shader.Find("Universal Render Pipeline/Lit")??
+                    Resources.Load<Shader>("Clay");
+                blackResinMaterial=new Material(shader){name="Black Resin"};
+                blackResinMaterial.SetColor("_BaseColor",new Color(0.035f,0.029f,0.043f));
+                if(blackResinMaterial.HasProperty("_Smoothness"))
+                    blackResinMaterial.SetFloat("_Smoothness",0.72f);
+            }
+            if(blackResinMesh!=null) return;
+            float t=(1f+Mathf.Sqrt(5f))*0.5f;
+            Vector3[] points=
+            {
+                new(-1,t,0),new(1,t,0),new(-1,-t,0),new(1,-t,0),
+                new(0,-1,t),new(0,1,t),new(0,-1,-t),new(0,1,-t),
+                new(t,0,-1),new(t,0,1),new(-t,0,-1),new(-t,0,1)
+            };
+            int[] triangles=
+            {
+                0,11,5, 0,5,1, 0,1,7, 0,7,10, 0,10,11,
+                1,5,9, 5,11,4, 11,10,2, 10,7,6, 7,1,8,
+                3,9,4, 3,4,2, 3,2,6, 3,6,8, 3,8,9,
+                4,9,5, 2,4,11, 6,2,10, 8,6,7, 9,8,1
+            };
+            for(int i=0;i<points.Length;i++) points[i].Normalize();
+            blackResinMesh=new Mesh{name="Black Resin growth mesh"};
+            blackResinMesh.vertices=points;
+            blackResinMesh.triangles=triangles;
+            blackResinMesh.RecalculateNormals();
+            blackResinMesh.RecalculateBounds();
         }
 
         private void ReleaseTreeMeshes(TreeSeed tree)
         {
-            if(tree.mesh!=null) Destroy(tree.mesh);
-            if(tree.trunkMesh!=null) Destroy(tree.trunkMesh);
+            if(tree.mesh!=null) ReleaseMesh(tree.mesh);
+            if(tree.trunkMesh!=null) ReleaseMesh(tree.trunkMesh);
             foreach(var part in tree.trunkPartMeshes)
-                if(part!=null&&part!=tree.trunkMesh) Destroy(part);
-            if(tree.distantMesh!=null) Destroy(tree.distantMesh);
-            foreach(var branch in tree.branchMeshes) if(branch!=null) Destroy(branch);
-            tree.mesh=null; tree.trunkMesh=null; tree.distantMesh=null;
+                if(part!=null&&part!=tree.trunkMesh) ReleaseMesh(part);
+            foreach(var branch in tree.branchMeshes) if(branch!=null) ReleaseMesh(branch);
+            tree.mesh=null; tree.trunkMesh=null;
             tree.branchMeshes.Clear(); tree.trunkPartMeshes.Clear();
             tree.branchParents.Clear();
         }
+        private static void ReleaseMesh(Mesh mesh)
+        { if(Application.isPlaying) Destroy(mesh); else DestroyImmediate(mesh); }
+        private static void ReleaseAsset(Object asset)
+        { if(Application.isPlaying) Destroy(asset); else DestroyImmediate(asset); }
 
         private static bool IsStump(int seed) => seed % 7 == 0;
 
@@ -579,7 +557,7 @@ namespace Wyvernland
 
         private static Mesh GenerateTreeMesh(int seed,bool woodland,Vector3 terrainNormal,
             bool darkWood,List<Mesh> branchMeshes,out Mesh trunkMesh,out int trunkSections,
-            List<int> branchParents=null,List<Mesh> trunkPartMeshes=null)
+            List<int> branchParents=null,List<Mesh> trunkPartMeshes=null,float heightOverride=0f)
         {
             trunkSections=0;
             var random = new System.Random(seed);
@@ -677,7 +655,8 @@ namespace Wyvernland
             }
             // Full trees use the requested uniform height range. Trunk width,
             // branch length and bends continue to scale from this value.
-            float height = woodland ? Next(10f,40f) : Next(3f,20f);
+            float height = heightOverride>0f ? heightOverride :
+                woodland ? Next(10f,40f) : Next(3f,20f);
             float radius = height*Next(0.018f,0.06f);
             bool stump = darkWood?seed%100<40:!woodland&&IsStump(seed);
             // Keep the cut trunk visible above its broad roots. The previous
@@ -906,36 +885,119 @@ namespace Wyvernland
 
         private void OnDestroy()
         {
-            if(darkWoodMaterial!=null) Destroy(darkWoodMaterial);
+            if(darkWoodMaterial!=null) ReleaseAsset(darkWoodMaterial);
+            if(blackResinMaterial!=null) ReleaseAsset(blackResinMaterial);
+            if(blackResinMesh!=null) ReleaseAsset(blackResinMesh);
             foreach (TreeSeed tree in trees)
                 ReleaseTreeMeshes(tree);
-            foreach (Material material in materials) if (material != null) Destroy(material);
-            foreach (TrackedObject item in objects)
-                if (item.root != null) { if (item.hidden) item.root.SetActive(true); item.PhysicsActive(true); }
+            foreach (Material material in materials) if (material != null) ReleaseAsset(material);
         }
     }
 
-    // Marks generated visuals for streaming; destruction uses PhysicalDestructible.
+    // Tracks resin removed from its source tree.
+    public sealed class TreeResinGrowth : MonoBehaviour
+    {
+        Transform sourceTree;
+        System.Action onRemoved;
+
+        public void Initialize(Transform tree,System.Action removed)
+        { sourceTree=tree; onRemoved=removed; }
+
+        public void Drop()
+        {
+            if(!WebWorldSession.CanSimulate(gameObject)) return;
+            if(sourceTree==null||!transform.IsChildOf(sourceTree)) return;
+            transform.SetParent(null,true);
+            MarkRemoved();
+            Rigidbody body=GetComponent<Rigidbody>();
+            if(body==null) body=gameObject.AddComponent<Rigidbody>();
+            GetComponent<PhysicalDestructible>()?.RefreshMass();
+            body.isKinematic=false;
+            body.useGravity=true;
+            body.detectCollisions=true;
+            body.collisionDetectionMode=CollisionDetectionMode.ContinuousDynamic;
+            DynamicObjectSurfaceGuard.Ensure(body);
+            GetComponent<PickableObject>()?.TrackMovement();
+            body.WakeUp();
+            WebWorldSession.Dirty(gameObject);
+        }
+
+        void OnTransformParentChanged()
+        {
+            if(sourceTree==null||transform.IsChildOf(sourceTree)) return;
+            MarkRemoved();
+        }
+
+        void MarkRemoved()
+        {
+            onRemoved?.Invoke();
+            onRemoved=null;
+            sourceTree=null;
+        }
+    }
+
+    // Tracks destruction and support for a generated tree.
     public sealed class GeneratedTree : MonoBehaviour
     {
+        [System.Serializable] public sealed class NetworkHistory
+        {
+            public Vector3[] impacts,trunk;
+            public bool broken;
+            public int progress,threshold;
+            public float radius;
+            public string reason;
+        }
+        internal NetworkHistory CaptureNetworkHistory() => new() {
+            impacts=destructiveImpacts.ToArray(),trunk=trunkImpacts.ToArray(),broken=broken,
+            progress=trunkBreakProgress,threshold=impactsToBreak,radius=averageTrunkRadius,reason=LastBreakReason,
+        };
+        internal void ApplyNetworkHistory(NetworkHistory value)
+        {
+            if(value==null) return;
+            destructiveImpacts.Clear();if(value.impacts!=null) destructiveImpacts.AddRange(value.impacts);
+            trunkImpacts.Clear();if(value.trunk!=null) trunkImpacts.AddRange(value.trunk);
+            broken=value.broken;trunkBreakProgress=value.progress;impactsToBreak=value.threshold;
+            averageTrunkRadius=value.radius;LastBreakReason=value.reason;
+        }
         readonly List<Vector3> destructiveImpacts=new();
         readonly List<Vector3> trunkImpacts=new();
         readonly List<GameObject> impactMarkers=new();
         [SerializeField,Min(0.01f)] float averageTrunkRadius=0.5f;
-        [SerializeField,Range(4,10)] int impactsToBreak=4;
+        [SerializeField,Range(3,15)] int impactsToBreak=3;
+        readonly HashSet<TreeStructuralPart> structuralParts=new();
         const float MarkerDiameter=0.08f;
         Material markerMaterial;
+        Material breakCenterMaterial;
+        Material midpointMaterial;
+        GameObject breakCenterMarker;
+        GameObject midpointMarker;
         bool broken;
         int trunkBreakProgress;
-        float nextSupportCheck;
+        internal void RegisterPart(TreeStructuralPart part) => structuralParts.Add(part);
+        internal void UnregisterPart(TreeStructuralPart part) => structuralParts.Remove(part);
 
-        void FixedUpdate()
+        internal void ResetSplitParts()
         {
-            if(Time.time<nextSupportCheck) return;
-            nextSupportCheck=Time.time+0.5f;
-            ValidateTrunkConnections();
+            var roots=new List<TreeStructuralPart>();
+            foreach(var part in structuralParts)
+                if(part!=null&&part.IsTrunk&&part.IsStructuralRoot&&part.gameObject.activeInHierarchy&&
+                    part.GetComponent<PhysicalDestructible>() is { HasBeenDestroyed: false }) roots.Add(part);
+            foreach(var root in roots)
+            {
+                var tracker=root.GetComponent<GeneratedTree>();
+                if(tracker==null) tracker=root.gameObject.AddComponent<GeneratedTree>();
+                tracker.Configure(averageTrunkRadius,impactsToBreak);
+                tracker.broken=false;
+                tracker.trunkBreakProgress=0;
+                tracker.trunkImpacts.Clear();
+                tracker.destructiveImpacts.Clear();
+                tracker.LastBreakReason="No destruction recorded since the last split.";
+                root.AssignTree(tracker);
+            }
+            trunkBreakProgress=0;
+            trunkImpacts.Clear();
+            destructiveImpacts.Clear();
         }
-
         public void ValidateTrunkConnections()
         {
             foreach(var part in GetComponentsInChildren<TreeStructuralPart>())
@@ -943,51 +1005,76 @@ namespace Wyvernland
         }
 
         public float AverageTrunkRadius => averageTrunkRadius;
-        public float TrunkBreakRadius => 6f*averageTrunkRadius;
+        public float TrunkBreakRadius => 5f*averageTrunkRadius;
         public int ImpactsToBreak => impactsToBreak;
         public int TrunkBreakProgress => trunkBreakProgress;
         public bool IsBroken => broken;
+        public string LastBreakReason { get; private set; } = "No destruction recorded yet.";
         public IReadOnlyList<Vector3> DestructiveImpacts => destructiveImpacts;
 
         public void Configure(float radius,int threshold)
         {
             averageTrunkRadius=Mathf.Max(0.01f,radius);
-            impactsToBreak=Mathf.Clamp(threshold,4,10);
+            impactsToBreak=Mathf.Clamp(threshold,3,15);
         }
 
-        public bool BreakAtMidpoint()
+        public void ConfigureRadiusRange(float minimumRadius,float maximumRadius)
         {
-            if(broken) return true;
-            TreeStructuralPart crossing=null,upper=null;
+            // Normalize against the generated population's random size range.
+            // A single size uses the minimum threshold rather than dividing by zero.
+            float size=Mathf.InverseLerp(minimumRadius,maximumRadius,averageTrunkRadius);
+            impactsToBreak=Mathf.RoundToInt(Mathf.Lerp(3f,15f,size));
+        }
+
+        public void ShowBreakingPointAtMidpoint()
+        {
+            if(TryGetTrunkMidpoint(out Vector3 point)) ShowMidpointMarker(point);
+        }
+
+        private bool TryGetTrunkMidpoint(out Vector3 point)
+        {
+            point=default;
             float minimum=float.PositiveInfinity,maximum=float.NegativeInfinity;
-            var sections=GetComponentsInChildren<TreeStructuralPart>();
-            foreach(var part in sections)
+            TreeStructuralPart[] sections=GetComponentsInChildren<TreeStructuralPart>();
+            foreach(TreeStructuralPart part in sections)
             {
                 if(!part.IsTrunk) continue;
-                Mesh mesh=part.GetComponent<MeshFilter>()?.sharedMesh;
-                if(mesh==null) continue;
-                Bounds bounds=mesh.bounds;
-                float bottom=part.transform.TransformPoint(new Vector3(bounds.center.x,
-                    bounds.min.y,bounds.center.z)).y;
-                float top=part.transform.TransformPoint(new Vector3(bounds.center.x,
-                    bounds.max.y,bounds.center.z)).y;
+                if(!part.TryGetSolidBoundsInFrame(transform,out Bounds bounds)) continue;
+                float bottom=bounds.min.y,top=bounds.max.y;
                 minimum=Mathf.Min(minimum,bottom,top);
                 maximum=Mathf.Max(maximum,bottom,top);
             }
             if(!float.IsFinite(minimum)||!float.IsFinite(maximum)||maximum<=minimum)
                 return false;
             float middle=(minimum+maximum)*0.5f;
+            float nearest=float.PositiveInfinity;
+            point=transform.TransformPoint(new Vector3(0f,middle,0f));
+            foreach(TreeStructuralPart part in sections)
+            {
+                if(!part.IsTrunk) continue;
+                if(!part.TryGetSolidBoundsInFrame(transform,out Bounds bounds)) continue;
+                Vector3 sectionCenter=bounds.center;
+                float distance=Mathf.Abs(sectionCenter.y-middle);
+                if(distance>=nearest) continue;
+                nearest=distance;
+                point=transform.TransformPoint(new Vector3(sectionCenter.x,middle,sectionCenter.z));
+            }
+            return true;
+        }
+
+        public bool BreakAtMidpoint()
+        {
+            if(broken) return true;
+            TreeStructuralPart crossing=null,upper=null;
+            if(!TryGetTrunkMidpoint(out Vector3 cutPoint)) return false;
+            var sections=GetComponentsInChildren<TreeStructuralPart>();
             float nearestCut=float.PositiveInfinity,nearestJoint=float.PositiveInfinity;
             foreach(var part in sections)
             {
                 if(!part.IsTrunk) continue;
-                Mesh mesh=part.GetComponent<MeshFilter>()?.sharedMesh;
-                if(mesh==null) continue;
-                Bounds bounds=mesh.bounds;
-                float a=part.transform.TransformPoint(new Vector3(bounds.center.x,
-                    bounds.min.y,bounds.center.z)).y;
-                float b=part.transform.TransformPoint(new Vector3(bounds.center.x,
-                    bounds.max.y,bounds.center.z)).y;
+                if(!part.TryGetSolidBoundsInFrame(part.transform,out Bounds bounds)) continue;
+                float middle=part.transform.InverseTransformPoint(cutPoint).y;
+                float a=bounds.min.y,b=bounds.max.y;
                 float low=Mathf.Min(a,b),high=Mathf.Max(a,b);
                 float centre=Mathf.Abs((low+high)*0.5f-middle);
                 if(middle>low+0.001f&&middle<high-0.001f&&centre<nearestCut)
@@ -995,21 +1082,24 @@ namespace Wyvernland
                 if(part.CanBreakTrunkSupport&&Mathf.Abs(low-middle)<nearestJoint)
                 { upper=part; nearestJoint=Mathf.Abs(low-middle); }
             }
-            Vector3 cutPoint=new(transform.position.x,middle,transform.position.z);
             if(crossing!=null&&crossing.GetComponent<PhysicalDestructible>() is { } solid&&
                 solid.ApplyImpact(10f,10f,1f,cutPoint,Vector3.up,30f,
                     treeSplitPoint:cutPoint))
                 broken=true;
             else if(upper!=null&&upper.BreakTrunkSupport())
                 broken=true;
+            if(this==null) return true; // Splitting a detached trunk may remove this owner.
             if(!broken) return false;
-            trunkBreakProgress=impactsToBreak;
+            LastBreakReason="Tree split at its midpoint.";
+            ShowMidpointMarker(cutPoint);
+            trunkBreakProgress=0;
             trunkImpacts.Clear();
             return true;
         }
 
         public void RecordDestructiveImpact(Vector3 point,bool trunkImpact=true)
         {
+            DropNearbyResin(point);
             destructiveImpacts.Add(point);
             if(trunkImpact) trunkImpacts.Add(point);
             ShowImpactMarker(point);
@@ -1023,61 +1113,117 @@ namespace Wyvernland
                 if(Application.isPlaying) Destroy(oldest);
                 else DestroyImmediate(oldest);
             }
-            if(broken||!trunkImpact) return;
-            float collisionRange=TrunkBreakRadius;
-            float radiusSquared=collisionRange*collisionRange;
-            trunkBreakProgress=0;
-            for(int i=0;i<trunkImpacts.Count;i++)
+            if(!trunkImpact)
+            { LastBreakReason="Only trunk destruction counts toward splitting."; return; }
+            DensestImpactCenter(trunkImpacts,TrunkBreakRadius,
+                out trunkBreakProgress);
+            if(trunkBreakProgress<impactsToBreak)
             {
-                Vector3 sum=Vector3.zero;
-                int count=0;
-                for(int j=0;j<trunkImpacts.Count;j++)
-                    if((trunkImpacts[j]-trunkImpacts[i]).sqrMagnitude<=radiusSquared)
-                    { sum+=trunkImpacts[j]; count++; }
-                Vector3 center=sum/count;
-                // Every counted point must be in the radius around the actual cut.
-                sum=Vector3.zero; count=0;
-                for(int j=0;j<trunkImpacts.Count;j++)
-                    if((trunkImpacts[j]-center).sqrMagnitude<=radiusSquared)
-                    { sum+=trunkImpacts[j]; count++; }
-                trunkBreakProgress=Mathf.Max(trunkBreakProgress,count);
-                if(count<impactsToBreak) continue;
-                center=sum/count;
-                TreeStructuralPart target=null,upper=null;
-                float nearest=float.PositiveInfinity,nearestJoint=float.PositiveInfinity;
-                foreach(var part in GetComponentsInChildren<TreeStructuralPart>())
-                {
-                    if(!part.IsTrunk||part.GetComponent<PhysicalDestructible>() is not { HasBeenDestroyed: false })
-                        continue;
-                    Mesh mesh=part.GetComponent<MeshFilter>()?.sharedMesh;
-                    if(mesh==null) continue;
-                    Bounds bounds=mesh.bounds;
-                    Vector3 bottom=part.transform.TransformPoint(new Vector3(bounds.center.x,bounds.min.y,bounds.center.z));
-                    Vector3 top=part.transform.TransformPoint(new Vector3(bounds.center.x,bounds.max.y,bounds.center.z));
-                    float jointDistance=Mathf.Abs(Mathf.Min(bottom.y,top.y)-center.y);
-                    if(part.CanBreakTrunkSupport&&jointDistance<nearestJoint)
-                    { nearestJoint=jointDistance; upper=part; }
-                    if(center.y<=Mathf.Min(bottom.y,top.y)+0.001f||
-                        center.y>=Mathf.Max(bottom.y,top.y)-0.001f) continue;
-                    float distance=part.DistanceTo(center);
-                    if(distance>=nearest) continue;
-                    nearest=distance; target=part;
-                }
-                // A chipped section may no longer enclose the average hit height.
-                // In that case release the nearest trunk joint so accumulated
-                // damage still severs the supported upper tree.
-                bool split=target!=null&&target.GetComponent<PhysicalDestructible>()
-                    .ApplyImpact(10f,10f,1f,center,Vector3.up,30f,
-                        treeSplitPoint:center);
-                if(!split&&upper!=null) split=upper.BreakTrunkSupport();
-                if(!split) split=BreakAtMidpoint();
-                if(!split) continue;
-                broken=true;
-                trunkBreakProgress=impactsToBreak;
-                destructiveImpacts.Clear();
-                trunkImpacts.Clear();
+                LastBreakReason=trunkImpacts.Count>=impactsToBreak?
+                    "Trunk destructions were too far apart.":
+                    $"Need {impactsToBreak-trunkBreakProgress} more nearby trunk destructions.";
                 return;
             }
+            // Nearby hits determine when the trunk fails; the hit that reaches
+            // the threshold determines where it divides.
+            Vector3 cutPoint=point;
+            var crossingSections=new List<TreeStructuralPart>();
+            TreeStructuralPart centerJoint=null;
+            foreach(var part in GetComponentsInChildren<TreeStructuralPart>())
+            {
+                if(!part.IsTrunk||part.GetComponent<PhysicalDestructible>() is not { HasBeenDestroyed: false })
+                    continue;
+                // Chipping clears the original mesh and installs a child
+                // remainder. Its live colliders carry the remaining solid.
+                if(!part.TryGetSolidBoundsInFrame(part.transform,out Bounds bounds)) continue;
+                float cutHeight=part.transform.InverseTransformPoint(cutPoint).y;
+                if(part.CanBreakTrunkSupport)
+                {
+                    if(Mathf.Abs(bounds.min.y-cutHeight)<=0.001f)
+                        centerJoint=part;
+                }
+                if(cutHeight>bounds.min.y+0.001f&&
+                    cutHeight<bounds.max.y-0.001f)
+                    crossingSections.Add(part);
+            }
+            crossingSections.Sort((a,b)=>a.DistanceTo(cutPoint).CompareTo(b.DistanceTo(cutPoint)));
+            bool split=false;
+            foreach(TreeStructuralPart part in crossingSections)
+                if(part!=null&&part.GetComponent<PhysicalDestructible>() is { HasBeenDestroyed: false } solid&&
+                    solid.ApplyImpact(10f,10f,1f,cutPoint,Vector3.up,30f,
+                        treeSplitPoint:cutPoint))
+                { split=true; break; }
+            // A joint at the hit height can divide a chipped trunk when no
+            // solid mesh remains there. A different joint cannot move the cut.
+            if(!split&&centerJoint!=null) split=centerJoint.BreakTrunkSupport();
+            if(this==null) return;
+            if(!split)
+            {
+                LastBreakReason=crossingSections.Count==0&&centerJoint==null?
+                    "No supported trunk remains at the last hit height.":
+                    "The cut could not produce two valid solid halves.";
+                return;
+            }
+            broken=true;
+            LastBreakReason="Tree split at the last destruction point.";
+            ShowBreakCenterMarker(cutPoint);
+            trunkBreakProgress=0;
+            destructiveImpacts.Clear();
+            trunkImpacts.Clear();
+        }
+
+        public void DropNearbyResin(Vector3 point)
+        {
+            const float releaseDistance=1f;
+            foreach(TreeResinGrowth growth in GetComponentsInChildren<TreeResinGrowth>())
+            {
+                Collider collider=growth.GetComponent<Collider>();
+                Vector3 nearest=collider!=null&&collider.enabled?
+                    collider.ClosestPoint(point):growth.transform.position;
+                if((nearest-point).sqrMagnitude<=releaseDistance*releaseDistance)
+                    growth.Drop();
+            }
+        }
+
+        public static Vector3 DensestImpactCenter(IReadOnlyList<Vector3> impacts,
+            float radius,out int count)
+        {
+            count=0;
+            if(impacts==null||impacts.Count==0) return Vector3.zero;
+            float radiusSquared=Mathf.Max(0f,radius)*Mathf.Max(0f,radius);
+            Vector3 bestCenter=impacts[0];
+            float bestLatestDistance=float.PositiveInfinity;
+            Vector3 latest=impacts[impacts.Count-1];
+            for(int i=0;i<impacts.Count;i++)
+            {
+                Vector3 center=impacts[i];
+                for(int pass=0;pass<4;pass++)
+                {
+                    Vector3 sum=Vector3.zero;
+                    int nearby=0;
+                    for(int j=0;j<impacts.Count;j++)
+                        if((impacts[j]-center).sqrMagnitude<=radiusSquared)
+                        { sum+=impacts[j]; nearby++; }
+                    if(nearby==0) break;
+                    Vector3 next=sum/nearby;
+                    if((next-center).sqrMagnitude<0.000001f) { center=next; break; }
+                    center=next;
+                }
+                Vector3 finalSum=Vector3.zero;
+                int finalCount=0;
+                for(int j=0;j<impacts.Count;j++)
+                    if((impacts[j]-center).sqrMagnitude<=radiusSquared)
+                    { finalSum+=impacts[j]; finalCount++; }
+                if(finalCount==0) continue;
+                center=finalSum/finalCount;
+                float latestDistance=(center-latest).sqrMagnitude;
+                if(finalCount<count||finalCount==count&&latestDistance>=bestLatestDistance)
+                    continue;
+                count=finalCount;
+                bestCenter=center;
+                bestLatestDistance=latestDistance;
+            }
+            return bestCenter;
         }
 
         void ShowImpactMarker(Vector3 point)
@@ -1110,15 +1256,166 @@ namespace Wyvernland
             impactMarkers.Add(marker);
         }
 
+        void ShowBreakCenterMarker(Vector3 point)
+        {
+            if(breakCenterMarker!=null) return;
+            Shader shader=Shader.Find("Universal Render Pipeline/Unlit")??
+                Shader.Find("Unlit/Color")??Shader.Find("Sprites/Default")??
+                Shader.Find("Standard");
+            breakCenterMaterial=new Material(shader) { name="Tree destruction center yellow" };
+            if(breakCenterMaterial.HasProperty("_BaseColor"))
+                breakCenterMaterial.SetColor("_BaseColor",Color.yellow);
+            if(breakCenterMaterial.HasProperty("_Color"))
+                breakCenterMaterial.SetColor("_Color",Color.yellow);
+            breakCenterMarker=new GameObject("Tree destruction center point");
+            breakCenterMarker.transform.SetParent(transform,true);
+            breakCenterMarker.transform.position=point;
+            GameObject dot=GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            dot.name="Tree destruction center dot";
+            dot.AddComponent<TreeImpactMarker>();
+            dot.transform.SetParent(breakCenterMarker.transform,false);
+            dot.transform.localScale=Vector3.one*0.16f;
+            var collider=dot.GetComponent<Collider>();
+            collider.enabled=false;
+            if(Application.isPlaying) Destroy(collider);
+            else DestroyImmediate(collider);
+            var renderer=dot.GetComponent<MeshRenderer>();
+            renderer.sharedMaterial=breakCenterMaterial;
+            renderer.shadowCastingMode=UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows=false;
+
+            GameObject label=new("Tree destruction center label");
+            label.transform.SetParent(breakCenterMarker.transform,false);
+            label.transform.localPosition=Vector3.up*0.2f;
+            label.AddComponent<TreeImpactMarker>();
+            var text=label.AddComponent<TextMesh>();
+            text.text="BREAK POINT";
+            text.anchor=TextAnchor.MiddleCenter;
+            text.alignment=TextAlignment.Center;
+            text.characterSize=0.05f;
+            text.fontSize=48;
+            text.fontStyle=FontStyle.Bold;
+            text.color=Color.yellow;
+            label.AddComponent<TreeBreakCenterLabel>();
+            label.GetComponent<TreeImpactMarker>().RefreshVisibility();
+        }
+
+        void ShowMidpointMarker(Vector3 point)
+        {
+            if(midpointMarker!=null) return;
+            Shader shader=Shader.Find("Universal Render Pipeline/Unlit")??
+                Shader.Find("Unlit/Color")??Shader.Find("Sprites/Default")??
+                Shader.Find("Standard");
+            midpointMaterial=new Material(shader) { name="Tree midpoint break blue" };
+            if(midpointMaterial.HasProperty("_BaseColor"))
+                midpointMaterial.SetColor("_BaseColor",Color.blue);
+            if(midpointMaterial.HasProperty("_Color"))
+                midpointMaterial.SetColor("_Color",Color.blue);
+            midpointMarker=new GameObject("Tree midpoint break point");
+            midpointMarker.transform.SetParent(transform,true);
+            midpointMarker.transform.position=point;
+            GameObject dot=GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            dot.name="Tree midpoint break dot";
+            dot.transform.SetParent(midpointMarker.transform,false);
+            dot.transform.localScale=Vector3.one*0.16f;
+            dot.AddComponent<TreeImpactMarker>();
+            var collider=dot.GetComponent<Collider>();
+            collider.enabled=false;
+            if(Application.isPlaying) Destroy(collider);
+            else DestroyImmediate(collider);
+            var renderer=dot.GetComponent<MeshRenderer>();
+            renderer.sharedMaterial=midpointMaterial;
+            renderer.shadowCastingMode=UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows=false;
+
+            GameObject label=new("Breaking Point label");
+            label.transform.SetParent(midpointMarker.transform,false);
+            label.AddComponent<TreeImpactMarker>();
+            var text=label.AddComponent<TextMesh>();
+            text.text="Breaking Point";
+            text.anchor=TextAnchor.MiddleCenter;
+            text.alignment=TextAlignment.Center;
+            text.characterSize=0.05f;
+            text.fontSize=48;
+            text.fontStyle=FontStyle.Bold;
+            text.color=Color.white;
+            label.AddComponent<TreeBreakCenterLabel>();
+            label.GetComponent<TreeImpactMarker>().RefreshVisibility();
+            midpointMarker.AddComponent<TreeMidpointMarkerVisual>().Initialize(
+                dot.transform,label.transform,Mathf.Max(0.25f,averageTrunkRadius*1.25f));
+        }
+
         void OnDestroy()
         {
-            if(markerMaterial==null) return;
-            if(Application.isPlaying) Destroy(markerMaterial);
-            else DestroyImmediate(markerMaterial);
+            WebWorldSession.Removed(gameObject);
+            if(Application.isPlaying)
+            {
+                if(markerMaterial!=null) Destroy(markerMaterial);
+                if(breakCenterMaterial!=null) Destroy(breakCenterMaterial);
+                if(midpointMaterial!=null) Destroy(midpointMaterial);
+            }
+            else
+            {
+                if(markerMaterial!=null) DestroyImmediate(markerMaterial);
+                if(breakCenterMaterial!=null) DestroyImmediate(breakCenterMaterial);
+                if(midpointMaterial!=null) DestroyImmediate(midpointMaterial);
+            }
         }
     }
     // Visual-only marker: the destruction world's renderer scan must not turn it into a solid.
-    public sealed class TreeImpactMarker : MonoBehaviour { }
+    public sealed class TreeImpactMarker : MonoBehaviour
+    {
+        void OnEnable()
+        {
+            GameplayConsole.VisibilityChanged+=RefreshVisibility;
+            RefreshVisibility();
+        }
+        void OnDisable() => GameplayConsole.VisibilityChanged-=RefreshVisibility;
+
+        internal void RefreshVisibility()
+        {
+            Renderer visual=GetComponent<Renderer>();
+            if(visual!=null) visual.enabled=GameplayConsole.IsOpen;
+        }
+    }
+    public sealed class TreeBreakCenterLabel : MonoBehaviour
+    {
+        void LateUpdate()
+        {
+            if(WorldLoading.IsLoading||!GameplayConsole.IsOpen) return;
+            Camera view=Camera.main;
+            if(view!=null)
+                transform.rotation=Quaternion.LookRotation(
+                    view.transform.position-transform.position,Vector3.up);
+        }
+    }
+    public sealed class TreeMidpointMarkerVisual : MonoBehaviour
+    {
+        Transform dot,label;
+        float surfaceOffset;
+
+        public void Initialize(Transform markerDot,Transform markerLabel,float offset)
+        {
+            dot=markerDot;
+            label=markerLabel;
+            surfaceOffset=offset;
+            UpdatePosition();
+        }
+
+        void LateUpdate() { if(!WorldLoading.IsLoading&&GameplayConsole.IsOpen) UpdatePosition(); }
+
+        void UpdatePosition()
+        {
+            if(dot==null||label==null) return;
+            Camera view=Camera.main;
+            Vector3 outward=view!=null?view.transform.position-transform.position:Vector3.forward;
+            outward.y=0f;
+            if(outward.sqrMagnitude<0.0001f) outward=Vector3.forward;
+            Vector3 visiblePoint=transform.position+outward.normalized*surfaceOffset;
+            dot.position=visiblePoint;
+            label.position=visiblePoint+Vector3.up*0.3f;
+        }
+    }
     public static class MeshFaceReduction
     {
         public static Mesh Create(Mesh source,float fraction,string prefix)

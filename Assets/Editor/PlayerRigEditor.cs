@@ -14,6 +14,7 @@ namespace Wyvernland.Editor
         private const string MeshFolder = "Assets/Resources/Player/EditedMeshes";
         private static readonly string[] JointNames =
             { "Pelvis", "Waist", "LeftShoulder", "RightShoulder", "LeftElbow", "RightElbow",
+                "LeftWrist", "RightWrist",
                 "LeftHip", "RightHip", "LeftKnee", "RightKnee", "LeftAnkle", "RightAnkle", "RightFingers1", "RightFingers2", "RightFingers3", "RightThumb1", "RightThumb2" };
 
         private readonly struct PoseJoint
@@ -156,6 +157,9 @@ namespace Wyvernland.Editor
             }
             if (GUILayout.Button("Apply Rig to Game")) ApplyRig();
             EditorGUILayout.EndHorizontal();
+            if (FindChild(editingRoot.transform,"LeftWrist") == null ||
+                FindChild(editingRoot.transform,"RightWrist") == null)
+                if (GUILayout.Button("Add Wrist Joints")) AddWristsToEditingRig();
 
             scroll = EditorGUILayout.BeginScrollView(scroll);
             DrawPoseChecker();
@@ -301,6 +305,7 @@ namespace Wyvernland.Editor
                 clone.name = renderer.sharedMesh.name + " Editable";
                 renderer.sharedMesh = clone;
             }
+            AddWristsToEditingRig();
             Selection.activeGameObject = editingRoot;
             SceneView.lastActiveSceneView?.FrameSelected();
         }
@@ -311,6 +316,24 @@ namespace Wyvernland.Editor
                 ? Array.Empty<SkinnedMeshRenderer>()
                 : editingRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
             rendererIndex = Mathf.Clamp(rendererIndex, 0, Mathf.Max(0, renderers.Length - 1));
+        }
+
+        private void AddWristsToEditingRig()
+        {
+            if (editingRoot == null) return;
+            Transform oldLeft=FindChild(editingRoot.transform,"LeftWrist");
+            Transform oldRight=FindChild(editingRoot.transform,"RightWrist");
+            Undo.RegisterFullObjectHierarchyUndo(editingRoot,"Add wrist joints");
+            Mesh wristMesh=RiggedPlayerAvatar.EnsureWristJoints(editingRoot);
+            if(oldLeft==null)
+                Undo.RegisterCreatedObjectUndo(FindChild(editingRoot.transform,"LeftWrist").gameObject,
+                    "Add left wrist");
+            if(oldRight==null)
+                Undo.RegisterCreatedObjectUndo(FindChild(editingRoot.transform,"RightWrist").gameObject,
+                    "Add right wrist");
+            if(wristMesh!=null) wristMesh.name="HumanBody Wrist Rig Editable";
+            RefreshRenderers();
+            SceneView.RepaintAll();
         }
 
         private void DuringSceneGUI(SceneView sceneView)
@@ -422,6 +445,7 @@ namespace Wyvernland.Editor
         private void ApplyRig()
         {
             RestorePreviewPose();
+            AddWristsToEditingRig();
             EnsureFolder("Assets/Resources/Player", "EditedMeshes");
             foreach (SkinnedMeshRenderer renderer in renderers)
             {

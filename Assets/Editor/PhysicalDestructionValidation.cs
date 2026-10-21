@@ -8,6 +8,52 @@ namespace Wyvernland.Editor
 {
     public static class PhysicalDestructionValidation
     {
+        [MenuItem("Tools/Wyvernland/Validate Held Strike Reaction")]
+        public static void RunHeldStrikeReaction()
+        {
+            var initialRandomState=UnityEngine.Random.state;
+            UnityEngine.Random.InitState(20260927);
+            var root=new GameObject("Held strike reaction validation");
+            try
+            {
+                ValidateMetalDestructionChance();
+                ValidateHeldStrikeDecision(root);
+                ValidateSlowStrikeContact(root);
+                Debug.Log("HELD_STRIKE_REACTION_VALIDATION_PASS: solid contact and relative speed >3 m/s required; rebound speed and travel capped over 0.12 seconds with fixed local arm anchors; moving-target velocity, threshold boundary, triggers, no-hit waving, destruction, and terrain checked.");
+            }
+            finally
+            {
+                UnityEngine.Random.state=initialRandomState;
+                UnityEngine.Object.DestroyImmediate(root);
+            }
+        }
+
+        static void ValidateMetalDestructionChance()
+        {
+            Require(WorldConfig.IsMetalMaterial("Iron")&&
+                WorldConfig.IsMetalMaterial("native copper")&&
+                !WorldConfig.IsMetalMaterial("Hematite")&&
+                !WorldConfig.IsMetalMaterial("Stone"),
+                "The metal list distinguishes metals from ores and stone");
+            for(int resilience=4;resilience<=8;resilience++)
+                Require(Mathf.Abs(PhysicalDestructible.MetalDestructionChanceScale(
+                    "Iron",resilience)-(8f-resilience)/4f)<.0001f,
+                    "Each resilience point from four through eight removes another quarter of metal destruction chance");
+            Require(PhysicalDestructible.MetalDestructionChanceScale("Iron",3f)==1f&&
+                PhysicalDestructible.MetalDestructionChanceScale("Iron",9f)==0f&&
+                PhysicalDestructible.MetalDestructionChanceScale("Stone",8f)==1f,
+                "Metal chance clamps at its ends without changing nonmetals");
+        }
+
+        [MenuItem("Tools/Wyvernland/Validate Small Shatter Persistence")]
+        public static void RunSmallFragmentPersistence()
+        {
+            var initialRandomState=UnityEngine.Random.state;UnityEngine.Random.InitState(20260927);
+            var root=new GameObject("Small Shatter persistence validation");
+            try { ValidateUndersizedFragmentCollision(root);Debug.Log("SMALL_SHATTER_PERSISTENCE_VALIDATION_PASS"); }
+            finally { UnityEngine.Random.state=initialRandomState;UnityEngine.Object.DestroyImmediate(root); }
+        }
+
         [MenuItem("Tools/Wyvernland/Validate Physical Destruction")]
         public static void Run()
         {
@@ -19,6 +65,9 @@ namespace Wyvernland.Editor
                 ValidateProgressiveFragments(root);
                 ValidateFragmentReimpact(root);
                 ValidateUndersizedFragmentCollision(root);
+                ValidateSurfaceGuard(root);
+                ValidateHeldFragmentRetention(root);
+                ValidateHeldStrikeDecision(root);
                 UnityEngine.Random.InitState(20260927);
                 Require(Mathf.Approximately(PhysicalDestructible.ShatterOffsetMultiplier(10f),1f)&&
                     Mathf.Approximately(PhysicalDestructible.ShatterOffsetMultiplier(5f),1.35f)&&
@@ -41,19 +90,21 @@ namespace Wyvernland.Editor
                     PhysicalDestructible.Classify(5,5,false,3,7)==PhysicalDestructEffect.Fracture&&
                     PhysicalDestructible.Classify(5,5,true,5,5)==PhysicalDestructEffect.Depression,
                     "Similar objects can both select destruction, while Soft still selects Depression");
-                Require(PhysicalDestructible.PassesSimilarityChance(0f)&&
-                    PhysicalDestructible.PassesSimilarityChance(0.39999f)&&
-                    !PhysicalDestructible.PassesSimilarityChance(0.4f)&&
-                    !PhysicalDestructible.PassesSimilarityChance(1f),
-                    "Similarity has an exact 40 percent chance per object");
-                Require(Mathf.Abs(PhysicalDestructible.HardnessAfterCollision(5f,7f,0f)-4.75f)<0.0001f&&
+                Require(Mathf.Approximately(PhysicalDestructible.SimilarDestructionChance(0,0,0,0),.3f)&&
+                    Mathf.Approximately(PhysicalDestructible.SimilarDestructionChance(5,5,5,5),.155f)&&
+                    Mathf.Approximately(PhysicalDestructible.CollisionDestructionChance(10,10,10,10,1,2),.01f)&&
+                    Mathf.Approximately(PhysicalDestructible.CollisionDestructionChance(10,10,10,10,2,1),.01f),
+                    "Similar collisions fall from 30 percent to one percent without size bonuses overriding the floor");
+                Require(Mathf.Abs(PhysicalDestructible.HardnessAfterCollision(5f,6f,0f)-4.85f)<0.0001f&&
+                    Mathf.Abs(PhysicalDestructible.HardnessAfterCollision(5f,7f,0f)-4.8575f)<0.0001f&&
+                    Mathf.Abs(PhysicalDestructible.HardnessAfterCollision(5f,8f,0f)-4.864625f)<0.0001f&&
                     PhysicalDestructible.HardnessAfterCollision(5f,7f,0.1f)==5f&&
                     PhysicalDestructible.HardnessAfterCollision(5f,20f,0f)<5f&&
                     PhysicalDestructible.HardnessAfterCollision(5f,0f,0.9f)==5f&&
                     PhysicalDestructible.CollisionWearChance(0f)>PhysicalDestructible.CollisionWearChance(4f)&&
                     PhysicalDestructible.CollisionWearChance(4f)>PhysicalDestructible.CollisionWearChance(7f)&&
                     PhysicalDestructible.CollisionWearChance(7f)>PhysicalDestructible.CollisionWearChance(20f),
-                    "Collision wear removes five percent probabilistically, with decreasing chance and no resilience immunity");
+                    "Collision wear removes three percent, reduced another five percent per resilience above six, with decreasing chance and no resilience immunity");
                 foreach(var targetRecord in WorldConfig.ThermalMaterials)
                 {
                     var target=new GameObject("Physical validation "+targetRecord.Material);
@@ -62,7 +113,8 @@ namespace Wyvernland.Editor
                     targetProperties.ApplyMaterial(targetRecord.Material);
                     Require(targetProperties.Hardness>=targetRecord.MinimumHardness&&
                         targetProperties.Hardness<=targetRecord.MaximumHardness&&
-                        targetProperties.Resilience==targetRecord.Resilience,
+                        targetProperties.Resilience>=targetRecord.MinimumResilience&&
+                        targetProperties.Resilience<=targetRecord.MaximumResilience,
                         "Material hardness and resilience match catalog: "+targetRecord.Material);
                     foreach(var attackerRecord in WorldConfig.ThermalMaterials)
                     {
@@ -113,6 +165,13 @@ namespace Wyvernland.Editor
                 Require(PhysicalDestructible.FragmentImpulse(sourceCenter,sourceCenter,
                     Vector3.forward,4f,2f,0.08f).z>0f,
                     "A fragment at the source center uses the collision normal");
+                Vector3 woodVelocity=new Vector3(0f,1f,0f);
+                Vector3 woodImpulse=new Vector3(4f,40f,0f);
+                PhysicalDestructible.LimitWoodFragmentFlight(ref woodVelocity,ref woodImpulse,2f);
+                Require(woodImpulse.x==2f&&
+                    woodVelocity.y+woodImpulse.y/2f<=
+                        PhysicalDestructible.WoodFragmentMaximumUpwardSpeed+0.0001f,
+                    "Wood fragments keep outward motion without launching high");
                 float rockTotal=0f,stoneTotal=0f,firstRock=0f;
                 var rockValues=new HashSet<float>(); var stoneValues=new HashSet<float>();
                 for(int i=0;i<64;i++)
@@ -126,10 +185,10 @@ namespace Wyvernland.Editor
                     var rockProperties=PhysicalDestructible.Ensure(rock);
                     var stoneProperties=PhysicalDestructible.Ensure(stone);
                     Require(rockProperties.MaterialName=="Stone"&&stoneProperties.MaterialName=="Stone"&&
-                        rockProperties.Resilience==5f&&stoneProperties.Resilience==5f,
+                        rockProperties.Resilience==2f&&stoneProperties.Resilience==2f,
                         "Generic rocks and stones use the Stone material record");
-                    Require(rockProperties.Hardness>=4f&&rockProperties.Hardness<=7f&&
-                        stoneProperties.Hardness>=4f&&stoneProperties.Hardness<=7f,
+                    Require(rockProperties.Hardness>=2f&&rockProperties.Hardness<=5f&&
+                        stoneProperties.Hardness>=2f&&stoneProperties.Hardness<=5f,
                         "Every Stone-material hardness stays in the 4–7 range");
                     float originalRock=rockProperties.Hardness;
                     if(i==0) firstRock=originalRock;
@@ -240,7 +299,9 @@ namespace Wyvernland.Editor
                     new CombineInstance {mesh=original,transform=Matrix4x4.Translate(Vector3.up*2f)}
                 },true,true);
                 islands.GetComponent<MeshFilter>().sharedMesh=islandsMesh;
-                Require(PhysicalDestructible.Ensure(islands).ApplyImpact(10,5,1,
+                // Keep this a Fracture-sized impact so it tests shell separation
+                // independently of the partial-Shatter fragment volume budget.
+                Require(PhysicalDestructible.Ensure(islands).ApplyImpact(10,5,2,
                     islands.transform.position,Vector3.right,30),
                     "Disconnected closed shells can separate on impact");
                 var elevated=Fragments("Physical validation Detached Islands");
@@ -485,6 +546,29 @@ namespace Wyvernland.Editor
                     Fragments("Physical validation Tiny Obsidian").Length==0,
                     "Shatter is blocked below 0.002 cubic metres");
                 UnityEngine.Object.DestroyImmediate(tinyObsidian);
+                foreach(string material in new[]{"Wood","Burnt Wood","Iron"})
+                {
+                    string name="Physical validation Thin "+material;
+                    var thin=Cube(root,name,1f);
+                    thin.transform.localScale=new Vector3(0.03f,0.03f,0.3f);
+                    var thinProperties=PhysicalDestructible.Ensure(thin);
+                    thinProperties.ApplyMaterial(material);
+                    Require(thinProperties.SolidVolumeCubicMetres<
+                        PhysicalDestructible.MinimumFragmentationVolume&&
+                        thinProperties.ApplyImpact(10f,5f,1f,thin.transform.position,
+                            Vector3.right,30f)&&Fragments(name).Length>=2,
+                        "A thin small "+material+" stick can still break");
+                    if(thinProperties.LastEffect==PhysicalDestructEffect.Fracture)
+                        foreach(var fragment in Fragments(name))
+                        {
+                            Vector3 size=fragment.GetComponent<Renderer>().bounds.size;
+                            Require(size.z<0.3f&&size.x>0.025f&&size.y>0.025f,
+                                "Stick Fracture cuts across its long axis instead of splitting lengthwise");
+                        }
+                    foreach(var fragment in Fragments(name))
+                        UnityEngine.Object.DestroyImmediate(fragment.gameObject);
+                    if(thin!=null) UnityEngine.Object.DestroyImmediate(thin);
+                }
                 var nearLimitWood=Cube(root,"Physical validation Limit Wood",1);
                 nearLimitWood.transform.localScale=new Vector3(0.1f,0.1f,0.201f);
                 var nearLimitProperties=PhysicalDestructible.Ensure(nearLimitWood);
@@ -734,14 +818,430 @@ namespace Wyvernland.Editor
         static PhysicalDestructible[] Fragments(string sourceName) =>
             UnityEngine.Object.FindObjectsByType<PhysicalDestructible>(FindObjectsSortMode.None)
                 .Where(f=>f.name==sourceName+" fragment").ToArray();
+        static void ValidateHeldStrikeDecision(GameObject root)
+        {
+            var held=Cube(root,"Physical validation Strike Impactor",0.4f);
+            var heldProperties=PhysicalDestructible.Ensure(held);
+            heldProperties.ApplyMaterial("Iron");
+            var weak=Cube(root,"Physical validation Strike Target",0.4f);
+            string weakName=weak.name;
+            weak.transform.position=new Vector3(100f,0f,0f);
+            var weakProperties=PhysicalDestructible.Ensure(weak);
+            weakProperties.ApplyMaterial("Wood");
+            var strike=typeof(PhysicalDestructible).GetMethod("TryHeldStrikeDestruction",
+                System.Reflection.BindingFlags.Instance|
+                System.Reflection.BindingFlags.NonPublic);
+            Require((bool)strike.Invoke(heldProperties,new object[]{weakProperties,
+                    weak.transform.position-Vector3.right*0.2f,Vector3.right*30f})&&
+                Fragments(weakName).Length>0,
+                "A held strike destroys a target when its material and geometry rules allow it");
+            foreach(var fragment in Fragments(weakName))
+                UnityEngine.Object.DestroyImmediate(fragment.gameObject);
+            if(weak!=null) UnityEngine.Object.DestroyImmediate(weak);
+
+            var strong=Cube(root,"Physical validation Strike Blocker",0.4f);
+            strong.transform.position=new Vector3(102f,0f,0f);
+            var strongProperties=PhysicalDestructible.Ensure(strong);
+            strongProperties.Hardness=10f;
+            strongProperties.Resilience=10f;
+            Require(!(bool)strike.Invoke(heldProperties,new object[]{strongProperties,
+                    strong.transform.position-Vector3.right*0.2f,Vector3.right})&&
+                !strongProperties.HasBeenDestroyed&&!heldProperties.HasBeenDestroyed,
+                "An impact below destruction speed leaves both solids intact for rebound");
+
+            var actor=new GameObject("Physical validation Strike Avatar");
+            actor.transform.SetParent(root.transform);
+            var avatar=actor.AddComponent<RiggedPlayerAvatar>();
+            Transform shoulder=new GameObject("Strike Shoulder").transform;
+            shoulder.SetParent(actor.transform);
+            Transform elbow=new GameObject("Strike Elbow").transform;
+            elbow.SetParent(shoulder);
+            Transform hand=new GameObject("Strike Hand").transform;
+            hand.SetParent(elbow);
+            var heldBar=Cube(root,"Physical validation Held Strike Bar",1f);
+            heldBar.transform.localScale=new Vector3(0.03f,0.03f,0.3f);
+            PhysicalDestructible.Ensure(heldBar).ApplyMaterial("Iron");
+            var heldPickup=heldBar.AddComponent<PickableObject>();
+            Require(heldPickup.PickUp(hand),"Strike validation bar can be held");
+            var avatarFlags=System.Reflection.BindingFlags.Instance|
+                System.Reflection.BindingFlags.NonPublic;
+            typeof(RiggedPlayerAvatar).GetField("rightShoulder",avatarFlags).SetValue(avatar,shoulder);
+            typeof(RiggedPlayerAvatar).GetField("rightElbow",avatarFlags).SetValue(avatar,elbow);
+            typeof(RiggedPlayerAvatar).GetField("rightHandMarker",avatarFlags).SetValue(avatar,hand);
+            typeof(RiggedPlayerAvatar).GetField("heldRightHandItem",avatarFlags).SetValue(avatar,heldPickup);
+            typeof(RiggedPlayerAvatar).GetField("striking",avatarFlags).SetValue(avatar,true);
+            typeof(PickableObject).GetField("heldLinearVelocity",avatarFlags)
+                .SetValue(heldPickup,Vector3.right);
+            var resolve=typeof(PickableObject).GetMethod("TryResolveStrikeImpact",avatarFlags);
+            var weakHeld=Cube(root,"Physical validation Held Strike Target",0.4f);
+            string weakHeldName=weakHeld.name;
+            weakHeld.transform.position=new Vector3(104f,0f,0f);
+            PhysicalDestructible.Ensure(weakHeld).ApplyMaterial("Wood");
+            Require((bool)resolve.Invoke(heldPickup,new object[]{weakHeld.GetComponent<Collider>(),
+                    weakHeld.transform.position-Vector3.right*0.2f,Vector3.zero,
+                    (Vector3?) (Vector3.right*30f)})&&
+                avatar.IsStrikeMode&&
+                !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                    .GetValue(avatar),
+                "A destructive held strike leaves the hand moving through its strike");
+            Require((bool)resolve.Invoke(heldPickup,new object[]{strong.GetComponent<Collider>(),
+                    strong.transform.position-Vector3.right*0.2f,Vector3.zero,
+                    (Vector3?)Vector3.right})&&avatar.IsStrikeMode&&
+                !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                    .GetValue(avatar),
+                "A later collision cannot rebound a strike that already caused destruction");
+            avatar.CancelRightHandStrike();
+            typeof(RiggedPlayerAvatar).GetField("striking",avatarFlags).SetValue(avatar,true);
+            var speedSource=new GameObject("Strike mouse speed source");
+            speedSource.transform.SetParent(root.transform);
+            speedSource.SetActive(false);
+            var strikePlayer=speedSource.AddComponent<FirstPersonController>();
+            typeof(RiggedPlayerAvatar).GetField("player",avatarFlags)
+                .SetValue(avatar,strikePlayer);
+            var lookSpeed=typeof(FirstPersonController).GetField(
+                "<RawLookSpeedDegreesPerSecond>k__BackingField",avatarFlags);
+            lookSpeed.SetValue(strikePlayer,1000f);
+            var linearVelocity=typeof(PickableObject).GetField("heldLinearVelocity",avatarFlags);
+            var angularVelocity=typeof(PickableObject).GetField("heldAngularVelocity",avatarFlags);
+            linearVelocity.SetValue(heldPickup,Vector3.zero);
+            angularVelocity.SetValue(heldPickup,Vector3.up*30f);
+            Require(heldPickup.HeldSpeed>RiggedPlayerAvatar.MinimumReboundSpeed,
+                "Rotation contributes the moving tip's speed even when the object centre is stationary");
+            angularVelocity.SetValue(heldPickup,Vector3.zero);
+            var carrierReference=typeof(PickableObject).GetField("heldForwardReference",avatarFlags);
+            carrierReference.SetValue(heldPickup,speedSource.transform);
+            speedSource.GetComponent<Rigidbody>().linearVelocity=Vector3.right*6f;
+            linearVelocity.SetValue(heldPickup,Vector3.right*6f);
+            Quaternion measuredPose=heldPickup.transform.rotation;
+            Require(Mathf.Abs(heldPickup.HeldSpeed-6f)<0.001f&&
+                heldPickup.transform.rotation==measuredPose&&
+                speedSource.GetComponent<Rigidbody>().linearVelocity==Vector3.right*6f,
+                "Reading held-object speed includes world movement and leaves the pose and carrier velocity unchanged");
+            carrierReference.SetValue(heldPickup,null);
+            foreach(float speed in new[]{0f,1f,RiggedPlayerAvatar.MinimumReboundSpeed})
+            {
+                linearVelocity.SetValue(heldPickup,Vector3.right*speed);
+                Require((bool)resolve.Invoke(heldPickup,new object[]{strong.GetComponent<Collider>(),
+                        strong.transform.position-Vector3.right*0.2f,Vector3.zero,null})&&
+                    avatar.IsStrikeMode&&
+                    !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                        .GetValue(avatar),
+                    "Fast mouse input cannot rebound an object at or below the minimum rebound speed");
+            }
+            linearVelocity.SetValue(heldPickup,Vector3.right*(RiggedPlayerAvatar.MinimumReboundSpeed+0.01f));
+            Require(avatar.IsStrikeMode&&
+                !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags).GetValue(avatar),
+                "Fast waving without a collision does not bounce the hand");
+            Collider solid=strong.GetComponent<Collider>();
+            solid.isTrigger=true;
+            Require(!(bool)resolve.Invoke(heldPickup,new object[]{solid,
+                    strong.transform.position,Vector3.zero,null})&&avatar.IsStrikeMode,
+                "A trigger overlap never rebounds the holding hand");
+            solid.isTrigger=false;
+            float heldHardness=heldPickup.GetComponent<PhysicalDestructible>().Hardness;
+            foreach(float hardness in new[]{heldHardness,heldHardness-1f})
+            {
+                strongProperties.Hardness=hardness;
+                Require((bool)resolve.Invoke(heldPickup,new object[]{solid,
+                        strong.transform.position-Vector3.right*0.2f,Vector3.zero,null})&&
+                    avatar.IsStrikeMode&&
+                    !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                        .GetValue(avatar),
+                    "A fast hit on an equally hard or softer solid does not rebound the hand");
+            }
+            strongProperties.Hardness=10f;
+            lookSpeed.SetValue(strikePlayer,0f);
+            Require((bool)resolve.Invoke(heldPickup,new object[]{strong.GetComponent<Collider>(),
+                    strong.transform.position-Vector3.right*0.2f,Vector3.zero,null})&&
+                avatar.IsStrikeMode&&
+                (bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                    .GetValue(avatar),
+                "A harder solid hit briefly rebounds without ending the held strike");
+            var reboundPose=typeof(RiggedPlayerAvatar).GetMethod("ApplyStrikeReboundPose",avatarFlags);
+            Vector3 handRest=(Vector3)typeof(RiggedPlayerAvatar).GetField("RightHandPointOnElbow",
+                System.Reflection.BindingFlags.Static|avatarFlags).GetValue(null);
+            typeof(RiggedPlayerAvatar).GetField("rightElbowRestPosition",avatarFlags)
+                .SetValue(avatar,Vector3.forward*.4f);
+            foreach(float speed in new[]{4f,12f,60f})
+            {
+                avatar.CancelRightHandStrike();
+                shoulder.localPosition=Vector3.zero;shoulder.localRotation=Quaternion.identity;
+                elbow.localPosition=Vector3.forward*.4f;elbow.localRotation=Quaternion.identity;
+                hand.localPosition=handRest;
+                typeof(RiggedPlayerAvatar).GetField("striking",avatarFlags).SetValue(avatar,true);
+                typeof(RiggedPlayerAvatar).GetField("strikeAttackHeld",avatarFlags).SetValue(avatar,true);
+                Vector3 start=hand.position;
+                Quaternion savedShoulder=shoulder.localRotation,savedElbow=elbow.localRotation,
+                    savedWrist=hand.localRotation;
+                avatar.ReboundHeldStrike(heldPickup,Vector3.right,speed);
+                Require(((Vector3)typeof(RiggedPlayerAvatar).GetField("strikeReboundVelocity",avatarFlags)
+                    .GetValue(avatar)).magnitude<=6.001f,
+                    "Rebound velocity is capped even for a fast collision");
+                foreach(float elapsed in new[]{0f,.0001f,.02f,.04f,.119f,.12f,.121f,.2f})
+                {
+                    reboundPose.Invoke(avatar,new object[]{shoulder,elbow,hand,elapsed});
+                    Require(Vector3.Distance(hand.position,start)<.25f&&
+                        Vector3.Distance(shoulder.localPosition,Vector3.zero)<.0001f&&
+                        Vector3.Distance(elbow.localPosition,Vector3.forward*.4f)<.0001f&&
+                        Vector3.Distance(hand.localPosition,handRest)<.0001f,
+                        "Rebound travel is bounded and all arm joints keep their local anchors");
+                    Require((bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags).GetValue(avatar)==(elapsed<.12f),
+                        "Every rebound lasts exactly 0.12 seconds regardless of collision speed");
+                }
+                Require(avatar.IsStrikeMode&&
+                    (bool)typeof(RiggedPlayerAvatar).GetField("strikeAttackHeld",avatarFlags).GetValue(avatar)&&
+                    Quaternion.Angle(shoulder.localRotation,savedShoulder)<.01f&&
+                    Quaternion.Angle(elbow.localRotation,savedElbow)<.01f&&
+                    Quaternion.Angle(hand.localRotation,savedWrist)<.01f,
+                    "Rebound restores every joint direction and continues the held strike");
+            }
+            avatar.CancelRightHandStrike();
+            typeof(RiggedPlayerAvatar).GetField("striking",avatarFlags).SetValue(avatar,true);
+            Vector3 relativeStart=hand.position;
+            linearVelocity.SetValue(heldPickup,Vector3.zero);
+            Require((bool)resolve.Invoke(heldPickup,new object[]{solid,strong.transform.position,
+                    Vector3.left*4,(Vector3?)(Vector3.right*8)}),"Moving-target rebound resolves");
+            reboundPose.Invoke(avatar,new object[]{shoulder,elbow,hand,.04f});
+            Require(Vector3.Distance(hand.position,relativeStart)<.25f&&
+                ((Vector3)typeof(RiggedPlayerAvatar).GetField("strikeReboundVelocity",avatarFlags)
+                    .GetValue(avatar)).magnitude<=6.001f,
+                "Moving-target relative contact velocity still respects the rebound cap");
+            avatar.CancelRightHandStrike();
+            typeof(RiggedPlayerAvatar).GetField("striking",avatarFlags).SetValue(avatar,true);
+            strongProperties.IsTerrain=true;
+            Require((bool)resolve.Invoke(heldPickup,new object[]{strong.GetComponent<Collider>(),
+                    strong.transform.position-Vector3.right*0.2f,Vector3.zero,
+                    (Vector3?)Vector3.right})&&
+                (bool)typeof(RiggedPlayerAvatar).GetField("strikeEnding",avatarFlags)
+                    .GetValue(avatar)&&
+                !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                    .GetValue(avatar),
+                "A held object returns normally instead of rebounding from terrain");
+            strongProperties.IsTerrain=false;
+            UnityEngine.Object.DestroyImmediate(heldBar);
+            avatar.CancelRightHandStrike();
+            {
+                actor.transform.position=strong.transform.position-Vector3.right*0.2f;
+                var fragileHeld=Cube(root,"Physical validation Fragile Held Strike",0.25f);
+                // A compact 0.25 m cube is below the fragmentation-volume gate.
+                // Use a real slender stick so destruction is eligible here.
+                fragileHeld.transform.localScale=new Vector3(0.08f,0.08f,0.6f);
+                fragileHeld.transform.position=hand.position;
+                PhysicalDestructible.Ensure(fragileHeld).ApplyMaterial("Wood");
+                var fragilePickup=fragileHeld.AddComponent<PickableObject>();
+                Require(fragilePickup.PickUp(hand),"A fragile strike object can be held");
+                typeof(RiggedPlayerAvatar).GetField("heldRightHandItem",avatarFlags)
+                    .SetValue(avatar,fragilePickup);
+                typeof(RiggedPlayerAvatar).GetField("striking",avatarFlags).SetValue(avatar,true);
+                var fragileProperties=fragilePickup.GetComponent<PhysicalDestructible>();
+                // Pickup installs a 0.25 s geometry cooldown. Editor tests do
+                // not advance Time.time, so expire it before testing an impact.
+                typeof(PhysicalDestructible).GetField("nextImpact",avatarFlags)
+                    .SetValue(fragileProperties,-1f);
+                bool fragileResolved=(bool)resolve.Invoke(fragilePickup,new object[]{strong.GetComponent<Collider>(),
+                        fragileHeld.transform.position,Vector3.zero,
+                        (Vector3?)(Vector3.right*30f)});
+                Require(fragileResolved&&
+                    Fragments("Physical validation Fragile Held Strike").Length>0&&
+                    !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",avatarFlags)
+                        .GetValue(avatar),
+                    $"A stronger target destroys the held strike object before a fast-wave rebound (resolved={fragileResolved}, fragments={Fragments("Physical validation Fragile Held Strike").Length})");
+                foreach(var fragment in Fragments("Physical validation Fragile Held Strike"))
+                    UnityEngine.Object.DestroyImmediate(fragment.gameObject);
+                if(fragileHeld!=null) UnityEngine.Object.DestroyImmediate(fragileHeld);
+            }
+            UnityEngine.Object.DestroyImmediate(actor);
+            foreach(var fragment in Fragments(weakHeldName))
+                UnityEngine.Object.DestroyImmediate(fragment.gameObject);
+            if(weakHeld!=null) UnityEngine.Object.DestroyImmediate(weakHeld);
+            UnityEngine.Object.DestroyImmediate(strong);
+            UnityEngine.Object.DestroyImmediate(held);
+        }
+        internal static void ValidateSlowStrikeContact(GameObject root)
+        {
+            var flags=System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.NonPublic;
+            foreach(bool left in new[]{false,true}) {
+                var actor=new GameObject("Slow strike actor");actor.transform.SetParent(root.transform);
+                actor.transform.position=new Vector3(left?310:300,100,0);
+                var avatar=actor.AddComponent<RiggedPlayerAvatar>();
+                var shoulder=new GameObject("Shoulder").transform;shoulder.SetParent(actor.transform,false);
+                var elbow=new GameObject("Elbow").transform;elbow.SetParent(shoulder,false);
+                var hand=new GameObject("Hand").transform;hand.SetParent(elbow,false);
+                void Set(string field,object value)=>typeof(RiggedPlayerAvatar).GetField(field,flags).SetValue(avatar,value);
+                string side=left?"left":"right";
+                Set(side+"Shoulder",shoulder);Set(side+"Elbow",elbow);Set(side+"HandMarker",hand);Set("strikeUsingLeftHand",left);
+                var held=GameObject.CreatePrimitive(PrimitiveType.Cube);held.name="Slow held bar";
+                held.transform.position=hand.position;held.transform.localScale=new Vector3(.1f,.1f,.8f);
+                PhysicalDestructible.Ensure(held).ApplyMaterial("Wood");
+                var pickup=held.AddComponent<PickableObject>();pickup.ForceRegularGrip=true;
+                Require(pickup.PickUp(hand),"Slow-strike fixture can pick up the bar");
+                Set(left?"heldLeftHandItem":"heldRightHandItem",pickup);
+                Vector3 grip=held.transform.InverseTransformPoint(hand.position),localGripPose=held.transform.localPosition;
+                var shape=held.GetComponents<Collider>().First(c=>c.enabled&&!c.isTrigger);
+                var wall=GameObject.CreatePrimitive(PrimitiveType.Cube);wall.transform.SetParent(root.transform);
+                var obstacle=wall.GetComponent<Collider>();
+                void Reset() {
+                    avatar.CancelRightHandStrike();elbow.localPosition=Vector3.zero;elbow.localRotation=Quaternion.identity;
+                    shoulder.localRotation=Quaternion.identity;hand.localRotation=Quaternion.identity;
+                    held.transform.localPosition=localGripPose;held.transform.localRotation=Quaternion.identity;
+                    obstacle.isTrigger=false;wall.transform.position=actor.transform.position+Vector3.up*10;
+                    pickup.SampleHeldMotion(.02f);Physics.SyncTransforms();Set("striking",true);
+                }
+                float Depth() {
+                    Physics.SyncTransforms();return Physics.ComputePenetration(shape,shape.transform.position,shape.transform.rotation,
+                        obstacle,obstacle.transform.position,obstacle.transform.rotation,out _,out float d)?d:0;
+                }
+                Reset();
+                wall.transform.localScale=new Vector3(2,2,.02f);
+                wall.transform.position=new Vector3(held.transform.position.x,held.transform.position.y,shape.bounds.max.z+.04f);
+                Vector3 before=held.transform.position;
+                hand.position+=Vector3.forward*.08f;pickup.SampleHeldMotion(.08f);
+                Require(Depth()<=.00021f&&held.transform.position.z>before.z&&held.transform.position.z<before.z+.08f,
+                    $"Slow translation stops at the solid surface with either holding hand (left={left}, depth={Depth()}, start={before}, end={held.transform.position})");
+                for(int i=0;i<20;i++) {
+                    Vector3 old=held.transform.position;hand.position+=Vector3.forward*.01f;pickup.SampleHeldMotion(.02f);
+                    float advance=held.transform.position.z-old.z;
+                    Require(advance>=-.00001f&&advance<=.01001f,
+                        $"Solid contact bounds each 1 cm step without reversing the held item (left={left}, step={i}, advance={advance}, depth={Depth()})");
+                }
+                Require(Depth()<=.00021f,$"Repeated slow pressure cannot creep deeper into a collider (left={left}, depth={Depth()}, hand={hand.position}, held={held.transform.position})");
+                Require(Vector3.Distance(held.transform.TransformPoint(grip),hand.position)<.0003f,
+                    "Collision stopping keeps the holding hand attached to its grip");
+                before=held.transform.position;hand.position-=Vector3.forward*.03f;pickup.SampleHeldMotion(.1f);
+                Require(held.transform.position.z<before.z-.029f&&Depth()==0,"Pulling away releases the contact immediately");
+
+                Reset();wall.transform.localScale=new Vector3(.02f,2,.3f);
+                wall.transform.position=held.transform.position+new Vector3(.14f,0,.3f);
+                Quaternion original=held.transform.rotation;
+                hand.rotation=Quaternion.AngleAxis(30,Vector3.up)*hand.rotation;pickup.SampleHeldMotion(1f);
+                float turned=Quaternion.Angle(original,held.transform.rotation);
+                Require(Depth()<=.00021f&&turned>1&&turned<29.9f,"Slow angular motion stops the bar before rotating through the solid");
+                hand.rotation=Quaternion.AngleAxis(-5,Vector3.up)*hand.rotation;pickup.SampleHeldMotion(.2f);
+                Require(Quaternion.Angle(original,held.transform.rotation)<turned-4.9f,"Rotation away from contact remains free");
+
+                Reset();wall.transform.localScale=new Vector3(.005f,2,2);
+                wall.transform.position=held.transform.position+Vector3.right*.2f;before=held.transform.position;
+                hand.position+=Vector3.right*.6f;pickup.SampleHeldMotion(1f);
+                Require(Depth()<=.00021f&&held.transform.position.x<before.x+.2f,
+                    "Slow movement cannot cross a thin wall even when the requested end pose is beyond it");
+
+                Reset();wall.transform.localScale=new Vector3(.02f,2,2);
+                wall.transform.position=held.transform.position+Vector3.right*.2f;obstacle.isTrigger=true;before=held.transform.position;
+                hand.position+=Vector3.right*.6f;pickup.SampleHeldMotion(1f);
+                Require(Mathf.Abs(held.transform.position.x-before.x-.6f)<.0003f,"Triggers do not stop slow strikes");
+
+                Reset();wall.transform.position=held.transform.position+Vector3.right*.2f;before=held.transform.position;
+                hand.position+=Vector3.right*.6f;pickup.SampleHeldMotion(.001f);
+                Require(Depth()<=.00021f&&held.transform.position.x<before.x+.2f,"Fast motion also stops smoothly at an indestructible collider");
+                Reset();PhysicalDestructible.Ensure(wall).ApplyMaterial("Wood");
+                wall.transform.position=held.transform.position+Vector3.right*.2f;before=held.transform.position;
+                hand.position+=Vector3.right*.6f;pickup.SampleHeldMotion(.001f);
+                Require(Mathf.Abs(held.transform.position.x-before.x-.6f)<.0003f,"Destructible fast impacts retain their damage and rebound handling");
+
+                Reset();PhysicalDestructible.Ensure(wall).ApplyMaterial("Wood");
+                wall.transform.position=held.transform.position+Vector3.right*.1f;before=held.transform.position;
+                hand.position+=Vector3.right*.08f;pickup.SampleHeldMotion(.016f);
+                Require(Depth()<=.00021f&&held.transform.position.x<before.x+.079f,
+                    "Contact stops non-destructive material impacts above 3 m/s but below the material damage threshold");
+
+                Reset();avatar.MarkStrikeDestruction();
+                wall.transform.position=held.transform.position+Vector3.right*.1f;before=held.transform.position;
+                hand.position+=Vector3.right*.08f;pickup.SampleHeldMotion(.016f);
+                Require(Depth()<=.00021f&&held.transform.position.x<before.x+.079f,
+                    "An earlier destruction or host-pending strike cannot bypass subsequent slow solid contact");
+
+                Reset();var hard=PhysicalDestructible.Ensure(wall);hard.Hardness=10;hard.Resilience=10;
+                wall.transform.localScale=new Vector3(2,2,.02f);
+                wall.transform.position=new Vector3(held.transform.position.x,held.transform.position.y,shape.bounds.max.z+.04f);
+                pickup.CaptureStrikeGrip();before=held.transform.position;
+                hand.position+=Vector3.forward*.08f;pickup.UpdateHeldPose();
+                Vector3 eased=held.transform.position;
+                Require(Depth()<=.00021f&&eased.z>before.z&&eased.z<before.z+.08f&&
+                    !(bool)typeof(RiggedPlayerAvatar).GetField("strikeRebounding",flags).GetValue(avatar),
+                    "Rendered held pose brakes before an indestructible impact can trigger abrupt rebound");
+                pickup.SampleHeldMotion(.08f);
+                Require(Vector3.Distance(held.transform.position,eased)<.0003f,"Final motion sampling does not apply the soft brake twice");
+
+                var input=new GameObject("Contact animation input");input.transform.SetParent(root.transform);input.SetActive(false);
+                Set("player",input.AddComponent<FirstPersonController>());
+                var camera=new GameObject("Contact animation camera").transform;camera.SetParent(root.transform);camera.position=actor.transform.position;
+                Set("cameraTransform",camera);Set(side+"ShoulderRestRotation",Quaternion.identity);Set(side+"ElbowRestRotation",Quaternion.identity);
+                Set(side+"ElbowRestScale",Vector3.one);Set(side+"ElbowRestPosition",Vector3.forward*.25f);
+                Vector3 stoppedElbow=elbow.localPosition;
+                typeof(RiggedPlayerAvatar).GetMethod("ApplyRightHandStrikePose",flags).Invoke(avatar,null);
+                Require(Vector3.Distance(elbow.localPosition,stoppedElbow)<.00001f,
+                    "The following animated frame cannot re-extend a stopped arm into contact and prevent withdrawal");
+            }
+            Debug.Log("SLOW_STRIKE_CONTACT_VALIDATION_PASS: both hands, translation and rotation, no sustained-pressure creep, immediate withdrawal, retained grip, thin-wall crossing, trigger exclusion, progressive braking at indestructible surfaces and destructible fast-impact preservation.");
+        }
+
+        static void ValidateSurfaceGuard(GameObject root)
+        {
+            var surface=GameObject.CreatePrimitive(PrimitiveType.Cube);
+            surface.transform.SetParent(root.transform);
+            surface.transform.position=new Vector3(1000f,1000f,1000f);
+            surface.transform.localScale=new Vector3(4f,1f,4f);
+            var dropped=GameObject.CreatePrimitive(PrimitiveType.Cube);
+            dropped.transform.SetParent(root.transform);
+            dropped.transform.position=new Vector3(1000f,1000.6f,1000f);
+            dropped.transform.localScale=Vector3.one*0.5f;
+            var body=dropped.AddComponent<Rigidbody>();
+            var guard=dropped.AddComponent<DynamicObjectSurfaceGuard>();
+            typeof(DynamicObjectSurfaceGuard).GetMethod("Awake",
+                System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance)
+                .Invoke(guard,null);
+            Physics.SyncTransforms();
+            Require(guard.ResolveStaticOverlap()&&body.position.y>1000.74f,
+                "A dropped object embedded in a larger static collider is lifted clear");
+            UnityEngine.Object.DestroyImmediate(dropped);
+            UnityEngine.Object.DestroyImmediate(surface);
+        }
+
+        static void ValidateHeldFragmentRetention(GameObject root)
+        {
+            var hand=new GameObject("Physical validation held hand");
+            hand.transform.SetParent(root.transform);
+            hand.transform.position=new Vector3(2000f,1000f,0f);
+            var source=Cube(root,"Physical validation held fracture",0.2f);
+            source.transform.position=hand.transform.position;
+            var properties=PhysicalDestructible.Ensure(source);
+            properties.MaterialName="Wood";
+            properties.Hardness=2f;
+            properties.Resilience=3f;
+            var pickup=source.AddComponent<PickableObject>();
+            Require(pickup.PickUp(hand.transform),"Validation object can be held");
+            // The pickup cooldown would have elapsed before a gameplay strike;
+            // Time.time stays fixed throughout this edit-mode validation.
+            typeof(PhysicalDestructible).GetField("nextImpact",
+                System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance)
+                .SetValue(properties,-1f);
+            Require(properties.ApplyImpact(6f,3f,1f,source.transform.position,
+                Vector3.up,30f),"Held source fractures");
+            var fragments=Fragments("Physical validation held fracture");
+            Require(fragments.Length>=2&&
+                fragments.Count(fragment=>fragment.GetComponent<PickableObject>()?.IsHeld==true)==1&&
+                fragments.Single(fragment=>fragment.GetComponent<PickableObject>()?.IsHeld==true)
+                    .transform.parent==hand.transform,
+                "Exactly one fragment remains attached to the hand after destruction");
+            foreach(var fragment in fragments)
+                UnityEngine.Object.DestroyImmediate(fragment.gameObject);
+            UnityEngine.Object.DestroyImmediate(hand);
+        }
+
         static void ValidateUndersizedFragmentCollision(GameObject root)
         {
-            var small=Cube(root,"Physical validation Transient Small Fragment",0.11f);
+            var small=Cube(root,"Physical validation Transient Small Fragment",1f);
+            small.transform.localScale=new Vector3(0.03f,0.03f,0.3f);
             var large=Cube(root,"Physical validation Transient Large Fragment",0.3f);
             var smallProperties=PhysicalDestructible.Ensure(small);
             var largeProperties=PhysicalDestructible.Ensure(large);
-            small.AddComponent<DestructionFragment>();
-            large.AddComponent<DestructionFragment>();
+            var smallFragment=small.AddComponent<DestructionFragment>();
+            var largeFragment=large.AddComponent<DestructionFragment>();
+            // Edit-mode components need the same collider registration that
+            // Awake performs automatically in the running game.
+            var fragmentAwake=typeof(DestructionFragment).GetMethod("Awake",
+                System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance);
+            fragmentAwake.Invoke(smallFragment,null);fragmentAwake.Invoke(largeFragment,null);
             Require(smallProperties.SolidVolumeCubicMetres<PhysicalDestructible.MinimumFragmentationVolume&&
                 largeProperties.SolidVolumeCubicMetres>=PhysicalDestructible.MinimumFragmentationVolume,
                 "The collision sample straddles the minimum destructible volume");
@@ -752,37 +1252,46 @@ namespace Wyvernland.Editor
                 "Colliding fragments trigger special Shatter for the undersized one");
             var debris=Fragments("Physical validation Transient Small Fragment");
             Require(debris.Length>=2&&debris.All(piece=>piece.GetComponent<TemporaryShatterDebris>()!=null),
-                "The undersized fragment is completely replaced with temporary Shatter debris");
+                "The undersized fragment is completely replaced with persistent Shatter pieces");
             foreach(var piece in debris)
             {
                 var temporary=piece.GetComponent<TemporaryShatterDebris>();
-                if(temporary.LifetimeSeconds==0f)
-                    typeof(TemporaryShatterDebris).GetMethod("Awake",
-                        System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance)
-                        .Invoke(temporary,null);
-                Require(Mathf.Approximately(temporary.LifetimeSeconds,5f)&&
-                    Physics.GetIgnoreCollision(piece.GetComponent<Collider>(),large.GetComponent<Collider>()),
-                    "Transient Shatter debris lasts five seconds and ignores other fragments");
-                Require(piece.GetComponent<MeshRenderer>().sharedMaterials.All(material=>
-                    material.shader.name=="Wyvernland/Fading Fragment"),
-                    "Temporary debris uses the transparent fade shader");
-                Vector3 fullScale=piece.transform.localScale;
-                typeof(TemporaryShatterDebris).GetField("spawnedAt",
-                    System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance)
-                    .SetValue(temporary,Time.unscaledTime-4f);
-                typeof(TemporaryShatterDebris).GetMethod("Update",
+                typeof(TemporaryShatterDebris).GetMethod("Awake",
                     System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance)
                     .Invoke(temporary,null);
-                Require(piece.transform.localScale.magnitude<fullScale.magnitude&&
-                    piece.GetComponent<MeshRenderer>().sharedMaterial.GetFloat("_FadeAlpha")<1f,
-                    "Temporary debris becomes smaller as it fades");
+                Require(Physics.GetIgnoreCollision(piece.GetComponent<Collider>(),large.GetComponent<Collider>()),
+                    "Small Shatter pieces keep ignoring other fragments");
+                var rest=piece.GetComponent<SmallFragmentRest>();
+                var body=piece.GetComponent<Rigidbody>();body.WakeUp();
+                body.linearVelocity=Vector3.right;body.angularVelocity=Vector3.zero;
+                Vector3 scale=piece.transform.localScale;
+                var material=piece.GetComponent<MeshRenderer>().sharedMaterial;
+                for(int step=0;step<100;step++) rest.CheckRest(.1f);
+                Require(piece!=null&&!rest.IsSettled&&piece.transform.localScale==scale&&
+                    piece.GetComponent<MeshRenderer>().sharedMaterial==material,
+                    "Moving debris remains opaque and full size beyond the old expiry");
+                body.linearVelocity=Vector3.zero;body.angularVelocity=Vector3.zero;
+                rest.CheckRest(.1f);rest.CheckRest(.1f);
+                Require(piece!=null&&rest.IsSettled&&piece.GetComponent<Rigidbody>()==null&&
+                    piece.GetComponentsInChildren<Collider>().Length==0&&
+                    piece.GetComponent<MeshRenderer>().sharedMaterial==material&&piece.transform.localScale==scale,
+                    "Stopped debris retains its mesh and appearance after only physics is removed");
                 UnityEngine.Object.DestroyImmediate(piece.gameObject);
             }
+            var compact=Cube(root,"Physical validation Compact Small Fragment",0.11f);
+            var compactProperties=PhysicalDestructible.Ensure(compact);
+            compact.AddComponent<DestructionFragment>();
+            Require(!(bool)collisionMethod.Invoke(compactProperties,new object[]{largeProperties,
+                    compact.transform.position,Vector3.up,30f})&&
+                !compactProperties.ApplyImpact(10f,10f,1f,compact.transform.position,
+                    Vector3.up,30f)&&!compactProperties.HasBeenDestroyed,
+                "A small compact fragment stays intact after a strong collision");
             foreach(bool terrain in new[]{false,true})
             {
                 string name=terrain?"Physical validation Tiny Terrain Hit":
                     "Physical validation Tiny Rock Hit";
-                var tiny=Cube(root,name,0.11f);
+                var tiny=Cube(root,name,1f);
+                tiny.transform.localScale=new Vector3(0.03f,0.03f,0.3f);
                 var target=Cube(root,name+" target",0.3f);
                 var tinyProperties=PhysicalDestructible.Ensure(tiny);
                 var targetProperties=PhysicalDestructible.Ensure(target);
@@ -793,7 +1302,9 @@ namespace Wyvernland.Editor
                     "An undersized fragment Shatters against "+(terrain?"terrain":"an ordinary rock"));
                 foreach(var piece in Fragments(name)) UnityEngine.Object.DestroyImmediate(piece.gameObject);
             }
-            var branch=Cube(root,"Physical validation Tiny Branch Fragment",0.11f);
+            var branch=Cube(root,"Physical validation Tiny Branch Fragment",1f);
+            string branchName=branch.name;
+            branch.transform.localScale=new Vector3(0.03f,0.03f,0.3f);
             var branchProperties=PhysicalDestructible.Ensure(branch);
             branchProperties.ApplyMaterial("Wood");
             branch.AddComponent<DestructionFragment>().IsBranchFragment=true;
@@ -804,19 +1315,19 @@ namespace Wyvernland.Editor
                 branch.transform.position,Vector3.up,30f})&&
                 !branchProperties.ApplyImpact(4.9f,weakProperties.Resilience,0.3f,
                     branch.transform.position,Vector3.up,30f)&&
-                !branchProperties.HasBeenDestroyed&&Fragments(branch.name).Length==0,
+                !branchProperties.HasBeenDestroyed&&Fragments(branchName).Length==0,
                 "An undersized branch fragment ignores impacts below twice its hardness");
             weakProperties.Hardness=10f;
             Require((bool)collisionMethod.Invoke(branchProperties,new object[]{weakProperties,
                 branch.transform.position,Vector3.up,1f})&&
-                !branchProperties.HasBeenDestroyed&&Fragments(branch.name).Length==0,
+                !branchProperties.HasBeenDestroyed&&Fragments(branchName).Length==0,
                 "Maximum hardness still needs sufficient impact speed");
             Require((bool)collisionMethod.Invoke(branchProperties,new object[]{weakProperties,
                 branch.transform.position,Vector3.up,30f})&&
-                branchProperties.HasBeenDestroyed&&Fragments(branch.name).Length>=2&&
-                Fragments(branch.name).All(piece=>piece.GetComponent<TemporaryShatterDebris>()!=null),
+                branchProperties.HasBeenDestroyed&&Fragments(branchName).Length>=2&&
+                Fragments(branchName).All(piece=>piece.GetComponent<TemporaryShatterDebris>()!=null),
                 "A qualifying high-speed impact replaces the small branch with fading debris");
-            foreach(var piece in Fragments(branch.name)) UnityEngine.Object.DestroyImmediate(piece.gameObject);
+            foreach(var piece in Fragments(branchName)) UnityEngine.Object.DestroyImmediate(piece.gameObject);
         }
         static void ValidateProgressiveFragments(GameObject root)
         {
@@ -928,8 +1439,9 @@ namespace Wyvernland.Editor
         static void Centered(PhysicalDestructible piece)
         {
             Require(DestructionMesh.VolumeCentroid(piece.GetComponent<MeshFilter>().sharedMesh)
-                .sqrMagnitude<1e-6f&&piece.GetComponent<Rigidbody>().centerOfMass.sqrMagnitude<1e-8f,
-                "Fragment pivot and Rigidbody center are at the mesh volume center");
+                .sqrMagnitude<1e-6f&&Vector3.Distance(piece.GetComponent<Rigidbody>().worldCenterOfMass,
+                    piece.transform.TransformPoint(piece.GetComponent<MeshFilter>().sharedMesh.bounds.center))<.0001f,
+                "Fragment pivot preserves volume centering and Rigidbody center matches the detached mesh center");
         }
         static bool SameBounds(Bounds a,Bounds b,float tolerance) =>
             Vector3.Distance(a.min,b.min)<tolerance&&Vector3.Distance(a.max,b.max)<tolerance;

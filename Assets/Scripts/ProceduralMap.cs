@@ -178,7 +178,7 @@ namespace Wyvernland
         private readonly System.Collections.Generic.List<Mesh> ownedMeshes = new();
         private Material clay;
         private StoneTerrainCutout stoneCutouts;
-        public int LastStoneCutoutTileCount=>stoneCutouts?.LastRebuiltTileCount??0;
+        public int LastStoneCutoutSurfaceCount=>stoneCutouts?.LastRebuiltSurfaceCount??0;
         public void BeginStonePitGeneration() => stoneCutouts?.BeginBatch();
         public bool TryGetOriginalStoneSurface(float x,float z,out RaycastHit hit)
         {
@@ -186,10 +186,31 @@ namespace Wyvernland
             return stoneCutouts!=null&&stoneCutouts.OriginalSurface(x,z,out hit);
         }
         public void FinishStonePitGeneration() { stoneCutouts?.EndBatch(); Physics.SyncTransforms(); }
-        public void CarvePickedUpStone(Mesh mesh,Matrix4x4 stoneToWorld)
+        internal System.Collections.IEnumerator PrepareStonePitSurfacesIncrementally() =>
+            stoneCutouts.PrepareSurfacesIncrementally();
+        internal System.Collections.IEnumerator FinishStonePitGenerationIncrementally()
         {
-            stoneCutouts?.Subtract(mesh,stoneToWorld);
+            var finish=stoneCutouts.EndBatchIncrementally();
+            while(finish.MoveNext()) yield return finish.Current;
+            Physics.SyncTransforms();
         }
+        public void CarveStoneTerrain(Mesh mesh,Matrix4x4 stoneToWorld) =>
+            stoneCutouts?.Subtract(mesh,stoneToWorld);
+        public void WriteBrowserPitTiles(System.IO.Stream destination) => stoneCutouts.WriteBrowserPitTiles(destination);
+        internal System.Collections.IEnumerator LoadBrowserPitTilesIncrementally()
+        {
+            var asset=Resources.Load<TextAsset>("Terrain/BrowserPitTiles");
+            if(asset==null) throw new System.InvalidOperationException("Browser pit tiles are missing. Rebuild the browser game.");
+            byte[] bytes=asset.bytes;
+            Resources.UnloadAsset(asset);
+            using var stream=new System.IO.MemoryStream(bytes,false);
+            var loading=stoneCutouts.ReadBrowserPitTiles(stream);
+            while(loading.MoveNext()) yield return loading.Current;
+            Physics.SyncTransforms();
+            Debug.Log($"BROWSER_PIT_TILES_LOADED {stoneCutouts.LastRebuiltSurfaceCount}");
+        }
+        public void DrawGrassSurface(UnityEngine.Rendering.CommandBuffer commands,Material material) =>
+            stoneCutouts?.DrawSurfaces(commands,material);
         public const float FallLimit = -900f;
         public bool IsMapCollider(Collider collider) => collider is MeshCollider mesh && surfaces.Contains(mesh);
 
@@ -249,20 +270,26 @@ namespace Wyvernland
 
         public void Build()
         {
+            var routine=BuildIncrementally();
+            while(routine.MoveNext()) { }
+        }
+
+        internal System.Collections.IEnumerator BuildIncrementally()
+        {
             if (WorldBootstrap.TestGround)
             {
                 BuildTestGround();
-                return;
+                yield break;
             }
             Debug.Log("WYVERNLAND_STARTUP ground layout begin");
             GroundFeatureLayout.Initialize();
             Debug.Log("WYVERNLAND_STARTUP ground layout complete");
+            yield return null;
             Shader shader = Resources.Load<Shader>("Clay");
             if (shader == null) throw new System.InvalidOperationException("Missing clay shader.");
             clay = new Material(shader) { name = "Unfired red-brown clay" };
             clay.SetColor("_BaseColor", WorldConfig.GroundColor);
             clay.SetFloat("_TerrainColorRegions", 1f);
-            clay.SetVectorArray("_DarkWoods",EnvironmentRegions.Woods);
             clay.SetColor("_DarkWoodColor",EnvironmentRegions.DarkBrown);
             var shaderRiverPoints=new System.Collections.Generic.List<Vector4>();
             foreach(RiverbedPoint[] river in Riverbeds)
@@ -277,23 +304,27 @@ namespace Wyvernland
             if(shaderRiverPoints.Count>80)
                 throw new System.InvalidOperationException(
                     $"Riverbed shader supports 80 control points, received {shaderRiverPoints.Count}.");
-            clay.SetInt("_RiverbedPointCount",shaderRiverPoints.Count);
-            clay.SetVectorArray("_RiverbedPoints",shaderRiverPoints);
+            GetComponent<CachedWorldShading>()?.BakeTerrainRegions(clay,shaderRiverPoints.ToArray());
             for (int i = 0; i < 3; i++)
             {
                 Debug.Log($"WYVERNLAND_STARTUP island {i+1} begin");
                 Mesh cached=Resources.Load<Mesh>($"Terrain/Island{i+1}");
-                if(cached!=null) AddIsland(i,cached);
+                if(cached!=null)
+                {
+                    var tiles = AddIslandIncrementally(i, cached);
+                    while (tiles.MoveNext()) yield return tiles.Current;
+                }
                 else BuildIsland(i);
                 Debug.Log($"WYVERNLAND_STARTUP island {i+1} complete");
+                yield return null;
             }
             Physics.SyncTransforms();
         }
 
         private void BuildTestGround()
         {
-            clay = new Material(Resources.Load<Shader>("Clay")) { name = "Test Ground grey" };
-            clay.SetColor("_BaseColor", new Color(0.5f, 0.5f, 0.5f));
+            clay = new Material(Resources.Load<Shader>("Clay")) { name = "Test Ground red-brown clay" };
+            clay.SetColor("_BaseColor", WorldConfig.GroundColor);
             clay.SetFloat("_TerrainColorRegions", 0f);
             Mesh mesh = new() { name = "200m x 200m plane" };
             mesh.vertices = new[] { new Vector3(-100,0,-100), new Vector3(-100,0,100),
@@ -303,7 +334,8 @@ namespace Wyvernland
             mesh.RecalculateBounds();
             ownedMeshes.Add(mesh);
             stoneCutouts??=new StoneTerrainCutout(transform);
-            stoneCutouts.AddSurface(mesh,clay,"Test Ground",collider=>surfaces.Add(collider));
+            var tiles = stoneCutouts.AddTiledSurfaceIncrementally(mesh,clay,"Test Ground",collider=>surfaces.Add(collider));
+            while (tiles.MoveNext()) { }
             Physics.SyncTransforms();
         }
 
@@ -551,8 +583,15 @@ namespace Wyvernland
 
         private void AddIsland(int island,Mesh mesh)
         {
+            var tiles = AddIslandIncrementally(island, mesh);
+            while (tiles.MoveNext()) { }
+        }
+
+        private System.Collections.IEnumerator AddIslandIncrementally(int island, Mesh mesh)
+        {
             stoneCutouts??=new StoneTerrainCutout(transform);
-            stoneCutouts.AddSurface(mesh,clay,$"Floating Island {island+1}",collider=>surfaces.Add(collider));
+            var tiles = stoneCutouts.AddTiledSurfaceIncrementally(mesh,clay,$"Floating Island {island+1}",collider=>surfaces.Add(collider));
+            while (tiles.MoveNext()) yield return tiles.Current;
         }
 
         private void OnDestroy()

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Play Wyvernland in your browser. Explore the island, climb, and experiment with its physical world.">
+  <meta name="theme-color" content="#101b19">
+  <title>Play Wyvernland</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23101b19'/%3E%3Cpath d='m12 17 10 30 10-20 10 20 10-30' fill='none' stroke='%23bad489' stroke-width='5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><a class="wordmark" href="./" aria-label="Wyvernland home">W<span>WYVERNLAND</span></a><span class="badge">PLAY IN YOUR BROWSER</span></header>
+  <main>
+    <section id="game-shell" aria-label="Wyvernland game">
+      <canvas id="unity-canvas" width="1280" height="720" tabindex="0" aria-label="Wyvernland game. Use a keyboard and mouse to play."></canvas>
+      <div id="welcome" class="overlay">
+        <svg class="landscape" viewBox="0 0 1280 720" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#274644"/><stop offset="1" stop-color="#172724"/></linearGradient></defs><rect width="1280" height="720" fill="url(#sky)"/><circle cx="968" cy="158" r="67" fill="#b7c9a3" opacity=".3"/><path d="m0 430 180-204 172 119 215-206 221 238 245-151 247 218v276H0" fill="#314e46"/><path d="m0 497 164-111 221 135 306-184 247 141 342-45v287H0" fill="#203a31"/><path d="m0 577 273-43 223 76 289-67 495 21v156H0" fill="#14281f"/><g fill="#11251e"><path d="m84 491 30-114 30 114h-18v130h-24V491m909 51 42-157 43 157h-29v133h-27V542m-3-66 36-133 36 133h-23v174h-25V476m173 86 49-198 50 198h-33v158h-31V562"/></g></svg>
+        <div class="intro"><p class="eyebrow">YOUR ISLAND AWAITS</p><h1>WYVERNLAND</h1><p class="description">Step into a world you can explore,<br>climb, and pull apart.</p><button id="play" class="primary">Play Wyvernland <span aria-hidden="true">↗</span></button><p id="device-note" class="small">Keyboard + mouse · No installation</p></div>
+      </div>
+      <div id="loading" class="overlay loading" hidden><div><p class="eyebrow">WYVERNLAND</p><h2>Preparing your adventure</h2><p id="status" role="status" aria-live="polite">Downloading the game…</p><progress id="progress" max="1" value="0" aria-label="Game download progress"></progress><p class="small">Loading your room's world. You can switch tabs while it prepares.</p></div></div>
+      <div id="error" class="overlay loading" hidden><div><h2>We couldn’t start the game</h2><p id="error-message" role="alert"></p><button id="retry" class="primary">Try again</button></div></div>
+      <div id="share-world-dialog" class="overlay loading" role="dialog" aria-modal="true" aria-labelledby="share-world-title" hidden><div><h2 id="share-world-title">Your world room</h2><p>Your current world is ready to share. Friends joining this link enter the world you are playing.</p><label for="share-world-link">Invite link</label><input id="share-world-link" readonly><div class="share-actions"><button id="share-world-copy" class="primary">Copy invite link</button><button id="share-world-close" class="primary">Done</button></div></div></div>
+      <div id="fullscreen-exit-hint" hidden><span>Hold Esc for 3 seconds to exit fullscreen</span><small>Your browser may exit sooner.</small><progress id="fullscreen-exit-progress" max="3000" value="0" aria-label="Escape hold progress"></progress></div>
+      <div id="toolbar"><span id="game-state">READY TO EXPLORE</span><span id="online-status" role="status">Create or join a room to play together</span><button id="share-world" hidden>Create room</button><button id="fullscreen" disabled aria-label="Enter fullscreen">Fullscreen <span aria-hidden="true">⛶</span></button></div>
+    </section>
+    <div class="below"><p>Move <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Jump <kbd>Space</kbd></span><span>Sprint <kbd>Shift</kbd></span><span>Menu <kbd>Esc</kbd></span></p><p class="tip">Click the game to capture your mouse. Hold Esc for 3 seconds to leave fullscreen; your browser may exit sooner.</p></div>
+  </main>
+  <div class="player-settings"><label for="player-name">Your player name</label><input id="player-name" maxlength="24" placeholder="Wanderer" autocomplete="nickname"><p>Explore together. Object movement, held items, and destruction are shared in your room.</p></div>
+  <section class="room-settings" aria-label="World rooms"><h2>Your world room</h2>
+    <div><label for="room-name">World name</label><input id="room-name" maxlength="48" placeholder="My world"><label for="room-map">Map</label><select id="room-map"><option value="island">Wyvernland</option><option value="test-ground">Test Ground</option></select><button id="create-room">Create room</button></div>
+    <div><label for="room-code">Join a friend</label><input id="room-code" maxlength="12" placeholder="Room code" autocomplete="off"><button id="join-room">Join room</button><button id="copy-room" disabled>Copy invite link</button></div>
+    <p id="room-status" role="status">Create a world or enter a friend's room code. Play creates a new room if none is selected.</p><p class="small">You can share your own world after entering it with Create room in the game toolbar. Press Esc to release the mouse. Room changes are saved; keep your invite link to return.</p>
+  </section>
+  <footer><span>WYVERNLAND</span><span>A world to make your own.</span></footer>
+  <script>
+    window.wyvernlandBuild = {
+      loaderUrl: "Build/{{{ LOADER_FILENAME }}}",
+      config: {
+        dataUrl: "Build/{{{ DATA_FILENAME }}}",
+        frameworkUrl: "Build/{{{ FRAMEWORK_FILENAME }}}",
+        codeUrl: "Build/{{{ CODE_FILENAME }}}",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: {{{ JSON.stringify(COMPANY_NAME) }}},
+        productName: {{{ JSON.stringify(PRODUCT_NAME) }}},
+        productVersion: {{{ JSON.stringify(PRODUCT_VERSION) }}},
+        devicePixelRatio: 1
+      }
+    };
+  </script>
+  <script src="background-loading.js"></script>
+  <script src="rooms.js"></script>
+  <script src="world.js"></script>
+  <script src="online.js"></script>
+  <script src="download.js"></script>
+  <script src="fullscreen.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>

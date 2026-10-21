@@ -9,9 +9,12 @@ namespace Wyvernland
         // Kilograms per cubic metre of material, excluding empty space.
         static readonly Dictionary<string,float> values=new(StringComparer.OrdinalIgnoreCase)
         {
-            ["Grass"]=150f, ["Wood"]=650f, ["Burnt Wood"]=650f,
+            ["Flesh"]=1050f, ["Grass"]=150f, ["Wood"]=650f, ["Burnt Wood"]=650f,
+            ["Black Resin"]=1100f,
+            ["Black Vine"]=650f, ["Yellow Vine"]=650f,
+            ["Iron"]=7870f,
             ["Quartz"]=2650f,
-            ["Magnetite"]=5170f, ["Limestone"]=2600f, ["Stone"]=2700f,
+            ["Magnetite"]=5170f, ["Limestone"]=2600f, ["Stone"]=2295f,
             ["River Rock"]=2650f, ["Chalk Stone"]=2200f, ["Obsidian"]=2370f,
             ["Coal"]=1300f, ["Hematite"]=5260f, ["Native Copper"]=8960f,
             ["Pyrite"]=5010f, ["Chalcocite"]=5700f, ["Limonite"]=3500f,

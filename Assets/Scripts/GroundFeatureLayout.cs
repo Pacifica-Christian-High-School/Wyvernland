@@ -24,7 +24,7 @@ namespace Wyvernland
         public float RockPileRadius;
     }
 
-    /// <summary>One deterministic layout shared by terrain carving and prop streaming.</summary>
+    /// <summary>One deterministic layout shared by terrain carving and resident props.</summary>
     public static class GroundFeatureLayout
     {
         public const float TerrainCellSize = 30f;

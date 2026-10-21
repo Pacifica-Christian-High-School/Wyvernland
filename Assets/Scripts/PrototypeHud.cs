@@ -34,6 +34,10 @@ namespace Wyvernland
         public static TextureQualityLevel Level { get; private set; } = TextureQualityLevel.High;
         public static bool IsHighQuality => Level==TextureQualityLevel.High;
 
+        internal static void ForgetRenderer(Renderer renderer) => rendererStates.Remove(renderer);
+        internal static void ForgetMaterial(Material material) => hiddenTextures.Remove(material);
+        internal static int TrackedRendererCount => rendererStates.Count;
+
         public static void GetOriginalAppearance(Renderer renderer,out Material[] materials,
             out MaterialPropertyBlock properties)
         {
@@ -51,7 +55,7 @@ namespace Wyvernland
         public static void SetHighQuality(bool highQuality) =>
             SetQuality(highQuality?TextureQualityLevel.High:TextureQualityLevel.Low);
 
-        public static void SetQuality(TextureQualityLevel level)
+        public static void SetQuality(TextureQualityLevel level,bool refreshRenderers=true)
         {
             foreach(var entry in textureSampling)
                 if(entry.Key!=null)
@@ -93,18 +97,29 @@ namespace Wyvernland
                         materialEntry.Key.SetTexture(textureEntry.Key,textureEntry.Value);
                 }
                 hiddenTextures.Clear();
-                RefreshColorOnlyObjects();
+                if(refreshRenderers) RefreshColorOnlyObjects();
                 return;
             }
 
-            RefreshColorOnlyObjects();
+            if(refreshRenderers) RefreshColorOnlyObjects();
         }
 
         public static void RefreshColorOnlyObjects()
         {
+            var routine=RefreshColorOnlyObjectsIncrementally();
+            while(routine.MoveNext()) { }
+        }
+
+        internal static System.Collections.IEnumerator RefreshColorOnlyObjectsIncrementally()
+        {
+            double batchStarted=Time.realtimeSinceStartupAsDouble;
             foreach(Renderer renderer in Object.FindObjectsByType<Renderer>(
                 FindObjectsInactive.Include,FindObjectsSortMode.None))
+            {
                 ApplyRendererQuality(renderer);
+                if(WorldLoading.ShouldYield(ref batchStarted))
+                { yield return null;batchStarted=Time.realtimeSinceStartupAsDouble; }
+            }
             Apply(RenderSettings.skybox);
         }
 
@@ -113,7 +128,15 @@ namespace Wyvernland
         public static void ApplyRendererQuality(Renderer renderer)
         {
             if(renderer==null) return;
+            var resident=renderer.GetComponent<ResidentRenderVisual>();
+            if(resident!=null) resident.ApplyQuality(Level);
             if(Level==TextureQualityLevel.High)
+            {
+                ApplyRendererShadows(renderer);
+                foreach(Material material in renderer.sharedMaterials) Apply(material);
+                return;
+            }
+            if(renderer.GetComponent<ResidentRenderVisual>()!=null)
             {
                 ApplyRendererShadows(renderer);
                 foreach(Material material in renderer.sharedMaterials) Apply(material);
@@ -161,6 +184,8 @@ namespace Wyvernland
                     color=RepresentativeColor(renderer,originals)
                 };
                 rendererStates.Add(renderer,state);
+                var lifetime=renderer.GetComponent<TextureQualityRendererLifetime>()??renderer.gameObject.AddComponent<TextureQualityRendererLifetime>();
+                lifetime.Track(renderer);
             }
             Material replacement=Level==TextureQualityLevel.Medium?
                 twoColorMaterial:flatColorMaterial;
@@ -207,7 +232,7 @@ namespace Wyvernland
             return false;
         }
 
-        private static Color RepresentativeColor(Renderer renderer,Material[] materials)
+        internal static Color RepresentativeColor(Renderer renderer,Material[] materials)
         {
             Material source=null;
             foreach(Material material in materials)
@@ -236,6 +261,7 @@ namespace Wyvernland
                     color=Color.clear;
                     foreach(Color vertexColor in colors) color+=vertexColor;
                     color/=colors.Length;
+                    if(QualitySettings.activeColorSpace==ColorSpace.Linear) color=color.gamma;
                 }
             }
             color.a=1f;
@@ -338,6 +364,26 @@ namespace Wyvernland
         }
     }
 
+    public static class GameplayConsole
+    {
+        public static bool IsOpen { get; private set; }
+        public static event System.Action VisibilityChanged;
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void Reset()
+        {
+            IsOpen=false;
+            VisibilityChanged=null;
+        }
+
+        public static void SetOpen(bool open)
+        {
+            if(IsOpen==open) return;
+            IsOpen=open;
+            VisibilityChanged?.Invoke();
+        }
+    }
+
     public sealed class PrototypeHud : MonoBehaviour
     {
         private FirstPersonController player;
@@ -346,11 +392,13 @@ namespace Wyvernland
         private GUIStyle titleStyle;
         private GUIStyle fpsStyle;
         private GUIStyle destructionStyle;
+        private GUIStyle treeReasonStyle;
         private string destructionName;
         private float destructionUntil;
         private float smoothedFrameTime=1f/60f;
         private readonly RaycastHit[] aimHits=new RaycastHit[64];
         private PhysicalDestructible aimedProperties;
+        private RopeObject aimedRope;
         private string aimedName;
 
         private void OnEnable() => PhysicalDestructible.DestructionOccurred+=ShowDestruction;
@@ -364,12 +412,23 @@ namespace Wyvernland
 
         public void Initialize(FirstPersonController controller)
         {
+            GameplayConsole.SetOpen(false);
             player = controller;
             pickup=controller.GetComponent<PlayerPickupController>();
         }
 
         private void Update()
         {
+            if(player!=null&&!player.IsPaused&&Application.isFocused&&Keyboard.current!=null&&
+                Keyboard.current[player.Bindings[FirstPersonController.ConsoleBindingIndex]].wasPressedThisFrame)
+                GameplayConsole.SetOpen(!GameplayConsole.IsOpen);
+            if(!GameplayConsole.IsOpen)
+            {
+                aimedProperties=null;
+                aimedRope=null;
+                aimedName=null;
+                return;
+            }
             if(Time.unscaledDeltaTime>0f)
                 smoothedFrameTime=Mathf.Lerp(smoothedFrameTime,Time.unscaledDeltaTime,0.08f);
             UpdateAimedProperties();
@@ -378,6 +437,7 @@ namespace Wyvernland
         private void UpdateAimedProperties()
         {
             aimedProperties=null;
+            aimedRope=null;
             aimedName=null;
             if(player==null||player.IsPaused||player.PlayerCamera==null) return;
 
@@ -397,6 +457,8 @@ namespace Wyvernland
                 nearest=aimHits[i].distance;
             }
             if(target==null) return;
+            aimedRope=target.GetComponentInParent<RopeObject>();
+            if(aimedRope!=null) { aimedName=aimedRope.MaterialName;return; }
             aimedProperties=PhysicalDestructible.Resolve(target);
             if(aimedProperties==null) return;
             PickableObject item=target.GetComponentInParent<PickableObject>();
@@ -406,21 +468,25 @@ namespace Wyvernland
 
         private void OnGUI()
         {
-            if (player == null || player.IsPaused) return;
+            if (player == null || player.IsPaused || !GameplayConsole.IsOpen) return;
             EnsureStyles();
 
-            bool showAim=aimedProperties!=null;
-            bool showHeld=pickup!=null&&pickup.HeldObject!=null;
-            TreeStructuralPart aimedStructure=showAim?
+            bool showAim=aimedProperties!=null||aimedRope!=null;
+            bool showRight=pickup!=null&&pickup.HeldObject!=null;
+            bool showLeft=pickup!=null&&pickup.HeldLeftObject!=null&&
+                pickup.HeldLeftObject!=pickup.HeldObject;
+            TreeStructuralPart aimedStructure=aimedProperties!=null?
                 aimedProperties.GetComponent<TreeStructuralPart>():null;
-            GeneratedTree aimedTree=aimedStructure!=null&&aimedStructure.IsTrunk?
-                aimedProperties.GetComponentInParent<GeneratedTree>():null;
-            int extraRows=(showAim?3:0)+(showHeld?3:0)+(aimedTree!=null?1:0);
+            GeneratedTree aimedTree=aimedStructure!=null?aimedStructure.Tree:null;
+            int extraRows=(showAim?3:0)+(showRight?5:0)+(showLeft?5:0)+(aimedTree!=null?3:0);
             GUI.Box(new Rect(18f,18f,400f,134f+extraRows*22f),GUIContent.none);
-            GUI.Label(new Rect(32f,28f,220f,24f),"WYVERNLAND — TERRAIN",titleStyle);
+            GUI.Label(new Rect(32f,28f,220f,24f),"CONSOLE",titleStyle);
             GUI.Label(new Rect(340f,28f,65f,24f),$"{1f/Mathf.Max(0.0001f,smoothedFrameTime):0} FPS",fpsStyle);
             GUI.Label(new Rect(32f, 54f, 290f, 22f), "Move, sprint and jump — controls in Options", labelStyle);
-            GUI.Label(new Rect(32f, 76f, 290f, 22f), "Mouse  Look    Esc  Pause menu", labelStyle);
+            Key consoleKey=player.Bindings[FirstPersonController.ConsoleBindingIndex];
+            string consoleShortcut=consoleKey==Key.Backquote?"`":consoleKey.ToString();
+            GUI.Label(new Rect(32f,76f,370f,22f),
+                $"Mouse  Look    Esc  Pause menu    {consoleShortcut}  Console",labelStyle);
 
             if (player != null)
             {
@@ -432,39 +498,69 @@ namespace Wyvernland
                     $"Coordinates  X {position.x:0.0}   Y {position.y:0.0}   Z {position.z:0.0}",labelStyle);
             }
             float detailY=142f;
-            if(showHeld)
+            if(showRight||showLeft)
             {
-                PickableObject held=pickup.HeldObject;
+                PickableObject held=showRight?pickup.HeldObject:pickup.HeldLeftObject;
                 Vector3 size=held.Size;
                 GUI.Label(new Rect(32f,detailY,370f,22f),
-                    $"Holding: {held.DisplayName}   Size {size.x:0.00} × {size.y:0.00} × {size.z:0.00} m",
+                    $"Holding {(pickup.HeldObject==pickup.HeldLeftObject?"both hands":showRight?"right":"left")}: {held.DisplayName}   Size {size.x:0.00} × {size.y:0.00} × {size.z:0.00} m",
                     labelStyle);
                 detailY+=22f;
                 DrawPhysicalProperties("Held",held,detailY);
                 detailY+=22f;
-                DrawMass(held.GetComponent<PhysicalDestructible>(),detailY);
+                DrawMass(held.GetComponent<PhysicalDestructible>(),detailY,held.Rope);
                 detailY+=22f;
+                DrawHeldSpeed(held,detailY);
+                detailY+=44f;
+            }
+            if(showRight&&showLeft)
+            {
+                PickableObject held=pickup.HeldLeftObject;
+                Vector3 size=held.Size;
+                GUI.Label(new Rect(32f,detailY,370f,22f),
+                    $"Holding left: {held.DisplayName}   Size {size.x:0.00} × {size.y:0.00} × {size.z:0.00} m",
+                    labelStyle);
+                detailY+=22f;
+                DrawPhysicalProperties("Left",held,detailY);
+                detailY+=22f;
+                DrawMass(held.GetComponent<PhysicalDestructible>(),detailY,held.Rope);
+                detailY+=22f;
+                DrawHeldSpeed(held,detailY);
+                detailY+=44f;
             }
             if(showAim)
             {
-                bool canPickUp=pickup!=null&&!pickup.HasRightHandItem&&
-                    pickup.AimedObject!=null&&
-                    pickup.AimedObject.gameObject==aimedProperties.gameObject;
+                bool canPickUp=pickup!=null&&pickup.AimedObject!=null&&
+                    pickup.AimedObject.gameObject==(aimedRope!=null?aimedRope.gameObject:aimedProperties.gameObject);
+                bool twoHands=canPickUp&&pickup.AimedObject.RequiresTwoHands;
+                bool tooHeavy=twoHands&&!pickup.AimedObject.CanPickUpWithTwoHands;
+                bool handsBusy=canPickUp&&(twoHands&&!tooHeavy?
+                    pickup.HasRightHandItem||pickup.HasLeftHandItem:
+                    pickup.HasRightHandItem&&pickup.HasLeftHandItem);
+                float dragSpeed=tooHeavy?PickableObject.DragSpeed(pickup.AimedObject.PickupMassKg,
+                    (pickup.HasRightHandItem?0:1)+(pickup.HasLeftHandItem?0:1)):0f;
                 GUI.Label(new Rect(32f,detailY,370f,22f),
-                    canPickUp?$"Pick up: {aimedName}  —  Hold E + Left Mouse":
+                    tooHeavy?(handsBusy?$"Free a hand to drag {aimedName}":
+                        $"Drag: {aimedName}  —  up to {dragSpeed:0.##} m/s"):
+                    handsBusy?$"Free {(twoHands?"both hands":"a hand")} to pick up {aimedName}":
+                    canPickUp?$"Pick up: {aimedName}  —  Interact + Left Mouse / {player.AimBindingName}":
                     $"Aiming: {aimedName}",labelStyle);
                 detailY+=22f;
-                GUI.Label(new Rect(32f,detailY,370f,22f),
-                    $"Aimed  Hardness {aimedProperties.Hardness:0.##}   Resilience {aimedProperties.Resilience:0.##}",
-                    labelStyle);
+                if(aimedRope!=null) DrawRopeShape("Aimed",aimedRope,detailY);
+                else GUI.Label(new Rect(32f,detailY,370f,22f),
+                    $"Aimed  Hardness {aimedProperties.Hardness:0.##}   Resilience {aimedProperties.Resilience:0.##}",labelStyle);
                 detailY+=22f;
-                DrawMass(aimedProperties,detailY);
+                DrawMass(aimedProperties,detailY,aimedRope);
                 detailY+=22f;
                 if(aimedTree!=null)
+                {
                     GUI.Label(new Rect(32f,detailY,370f,22f),
                         aimedTree.IsBroken?"Trunk break: already split":
                         $"Trunk break: {aimedTree.TrunkBreakProgress}/{aimedTree.ImpactsToBreak} damaging hits within {aimedTree.TrunkBreakRadius:0.0} m",
                         labelStyle);
+                    GUI.Label(new Rect(32f,detailY+22f,370f,44f),
+                        $"Last destruction: {aimedTree.LastBreakReason}",treeReasonStyle);
+                }
             }
 
             if(!string.IsNullOrEmpty(destructionName)&&Time.unscaledTime<destructionUntil)
@@ -476,8 +572,20 @@ namespace Wyvernland
 
         }
 
+        private void DrawHeldSpeed(PickableObject held,float y)
+        {
+            var avatar=player.GetComponent<RiggedPlayerAvatar>();
+            float bonus=avatar!=null&&avatar.IsStrikingHeldItem(held)?
+                (avatar.StrikeWavingSpeedMultiplier-1f)*100f:0f;
+            GUI.Label(new Rect(32f,y,370f,22f),
+                $"Object speed {held.HeldSpeed:0.00} m/s   Wave boost +{bonus:0}%",labelStyle);
+            GUI.Label(new Rect(32f,y+22f,370f,22f),
+                $"Rebound: > {RiggedPlayerAvatar.MinimumReboundSpeed:0.0} m/s against harder objects",labelStyle);
+        }
+
         private void DrawPhysicalProperties(string label,PickableObject item,float y)
         {
+            if(item.Rope!=null) { DrawRopeShape(label,item.Rope,y);return; }
             PhysicalDestructible properties=item.GetComponent<PhysicalDestructible>() ??
                 item.GetComponentInParent<PhysicalDestructible>() ??
                 PhysicalDestructible.Ensure(item.gameObject);
@@ -487,8 +595,18 @@ namespace Wyvernland
                 labelStyle);
         }
 
-        private void DrawMass(PhysicalDestructible properties,float y)
+        private void DrawRopeShape(string label,RopeObject rope,float y) =>
+            GUI.Label(new Rect(32f,y,370f,22f),
+                $"{label}  Rope   Radius {rope.RadiusMetres*100f:0.0} cm   Length {rope.LengthMetres:0.00} m",labelStyle);
+
+        private void DrawMass(PhysicalDestructible properties,float y,RopeObject rope=null)
         {
+            if(rope!=null)
+            {
+                GUI.Label(new Rect(32f,y,370f,22f),
+                    $"Mass {rope.MassKg:#,0.###} kg   {(rope.IsAttached?"Attached to branch":"Free rope")}",labelStyle);
+                return;
+            }
             if(properties==null) return;
             string text=properties.HasMaterialMass?
                 $"Mass {properties.MassKg:#,0.###} kg   Solid volume {properties.SolidVolumeCubicMetres:0.####} m³":
@@ -516,6 +634,7 @@ namespace Wyvernland
                 alignment=TextAnchor.UpperRight,
                 fontStyle=FontStyle.Bold
             };
+            treeReasonStyle=new GUIStyle(labelStyle) { wordWrap=true };
             destructionStyle=new GUIStyle(labelStyle)
             {
                 alignment=TextAnchor.MiddleCenter,
@@ -529,9 +648,9 @@ namespace Wyvernland
     [DefaultExecutionOrder(-100)]
     public sealed class PauseMenu : MonoBehaviour
     {
-        private const float OriginalSceneDepthRadius = 0.325f;
-        private const float HighTextureSceneDepthScale = 0.7f;
-        private const float LowTextureSceneDepthScale = 0.4f;
+        private const float OriginalDepthOfFieldRadius = 0.325f;
+        private const float HighTextureDepthOfFieldScale = 0.7f;
+        private const float LowTextureDepthOfFieldScale = 0.4f;
         private enum Page { Closed, Main, Pause, Options, Graphic, Keybinding, Audio }
         private Page page;
         private Page optionsRoot = Page.Pause;
@@ -542,30 +661,34 @@ namespace Wyvernland
         private bool previousAudioPause;
         private float originalVolume;
         private int originalVSync;
-        private float nextTextureQualityRefresh;
         private float volume;
         private bool muted;
         private bool initialized;
         private bool sessionStarted;
+        private bool startMenuOnly;
+#if UNITY_WEBGL && !UNITY_EDITOR
+        private float browserResumeTime;
+#endif
         private bool betterLight;
-        private bool sceneDepth;
+        private bool depthOfField;
         private bool fog;
         private TextureQualityLevel textureQuality;
-        private WorldObjectStreaming streaming;
+        private float loadingRange;
         private ProceduralGrass grass;
         private Vector2 graphicScroll;
-        private DepthOfField sceneDepthEffect;
+        private Vector2 keybindingScroll;
+        private DepthOfField depthOfFieldEffect;
         private readonly System.Collections.Generic.List<Vector2Int> resolutions = new();
         private int resolutionIndex;
         private GUIStyle heading;
         private GUIStyle button;
         private GUIStyle label;
 
-        public void Initialize(FirstPersonController controller)
+        public void Initialize(FirstPersonController controller,bool deferRendererQuality=false,bool startMenu=false)
         {
+            startMenuOnly = startMenu;
             player = controller;
             cameraData = player.PlayerCamera.GetUniversalAdditionalCameraData();
-            streaming = Object.FindFirstObjectByType<WorldObjectStreaming>();
             grass = Object.FindFirstObjectByType<ProceduralGrass>();
             originalVolume = AudioListener.volume;
             originalVSync = QualitySettings.vSyncCount;
@@ -574,17 +697,18 @@ namespace Wyvernland
             ApplyVolume();
             player.PlayerCamera.fieldOfView = Mathf.Clamp(PlayerPrefs.GetFloat("Options.Fov", 75f), 60f, 100f);
             betterLight = PlayerPrefs.GetInt("Options.BetterLight", 1) != 0;
-            sceneDepth = PlayerPrefs.GetInt("Options.SceneDepth", 1) != 0;
+            depthOfField = PlayerPrefs.GetInt("Options.DepthOfField", 1) != 0;
             fog = PlayerPrefs.GetInt("Options.Fog", 1) != 0;
+            loadingRange=PlayerWorldLoading.SavedRange;
             int savedTextureQuality=PlayerPrefs.GetInt("Options.TextureQuality",1);
             textureQuality=savedTextureQuality>=0&&savedTextureQuality<=2?
                 (TextureQualityLevel)savedTextureQuality:TextureQualityLevel.High;
-            ApplyTextureQuality();
+            ApplyTextureQuality(!deferRendererQuality);
             Volume sceneVolume = Object.FindFirstObjectByType<Volume>();
             if (sceneVolume != null)
-                sceneVolume.profile.TryGet(out sceneDepthEffect);
+                sceneVolume.profile.TryGet(out depthOfFieldEffect);
             ApplyLighting();
-            ApplySceneDepth();
+            ApplyDepthOfField();
             ApplyFog();
             foreach (Resolution mode in Screen.resolutions)
             {
@@ -598,9 +722,14 @@ namespace Wyvernland
                 PlayerPrefs.GetInt("Options.Height", Screen.height));
             resolutionIndex = resolutions.IndexOf(savedResolution);
             if (resolutionIndex < 0) resolutionIndex = resolutions.Count - 1;
-            if (!Application.isEditor && PlayerPrefs.HasKey("Options.Width"))
+            if (!Application.isEditor && Application.platform != RuntimePlatform.WebGLPlayer && PlayerPrefs.HasKey("Options.Width"))
                 ApplyResolution();
             QualitySettings.vSyncCount = PlayerPrefs.GetInt("Options.VSync", originalVSync) != 0 ? 1 : 0;
+            if(!deferRendererQuality || startMenuOnly) FinishInitialize();
+        }
+
+        internal void FinishInitialize()
+        {
             initialized = true;
             OpenMain();
             if (WorldBootstrap.EnterAfterBuild) EnterGame();
@@ -609,11 +738,19 @@ namespace Wyvernland
         private void Update()
         {
             if (!initialized) return;
-            if(Time.unscaledTime>=nextTextureQualityRefresh)
+            // Room synchronization may resume the controller while a menu is
+            // open. Keep input and the cursor consistent with the visible page.
+            if(page!=Page.Closed&&player!=null&&!player.IsPaused) player.SetPaused(true);
+#if UNITY_WEBGL && !UNITY_EDITOR
+            // Browsers consume Escape when releasing pointer lock. Pause even
+            // when that key never reaches Unity's keyboard input.
+            if (page == Page.Closed && Cursor.lockState != CursorLockMode.Locked &&
+                Time.unscaledTime - browserResumeTime > 0.5f)
             {
-                nextTextureQualityRefresh=Time.unscaledTime+1f;
-                ColorOnlyTextureQuality.RefreshColorOnlyObjects();
+                OpenPause();
+                return;
             }
+#endif
             if(Keyboard.current==null) return;
             if (Keyboard.current.escapeKey.wasPressedThisFrame)
             {
@@ -624,12 +761,25 @@ namespace Wyvernland
                 else Back();
                 return;
             }
+            if (binding == FirstPersonController.AimBindingIndex&&
+                Mouse.current!=null&&Mouse.current.rightButton.wasPressedThisFrame)
+            {
+                player.RebindAim(Key.None);
+                binding=-1;
+            }
             if (binding >= 0)
                 foreach (var key in Keyboard.current.allKeys)
                     if (key.wasPressedThisFrame)
                     {
-                        player.Rebind(binding, key.keyCode);
-                        binding = -1;
+                        if(binding==FirstPersonController.AimBindingIndex)
+                        {
+                            if(player.RebindAim(key.keyCode)) binding=-1;
+                        }
+                        else
+                        {
+                            player.Rebind(binding, key.keyCode);
+                            binding=-1;
+                        }
                         break;
                     }
         }
@@ -664,6 +814,9 @@ namespace Wyvernland
             Time.timeScale = PlayableTimeScale(previousTimeScale);
             AudioListener.pause = previousAudioPause;
             player.SetPaused(false);
+#if UNITY_WEBGL && !UNITY_EDITOR
+            browserResumeTime = Time.unscaledTime;
+#endif
         }
 
         private static float PlayableTimeScale(float value) => value>0f?value:1f;
@@ -680,7 +833,7 @@ namespace Wyvernland
 
         private void ReturnToMainMenu()
         {
-            PlayerSaveSystem.Save(player);
+            if (sessionStarted) PlayerSaveSystem.Save(player);
             Save();
             binding = -1;
             optionsRoot = Page.Main;
@@ -705,32 +858,32 @@ namespace Wyvernland
             // even when the optional richer lighting effect is disabled.
             cameraData.renderShadows = betterLight||
                 textureQuality==TextureQualityLevel.Medium;
-            cameraData.renderPostProcessing = betterLight || sceneDepth;
+            cameraData.renderPostProcessing = betterLight || depthOfField;
             Shader.SetGlobalFloat("_WyvernBetterLighting", betterLight ? 1f : 0f);
         }
 
-        private void ApplySceneDepth()
+        private void ApplyDepthOfField()
         {
-            cameraData.requiresDepthTexture = sceneDepth;
-            cameraData.renderPostProcessing = betterLight || sceneDepth;
-            if (sceneDepthEffect != null)
+            cameraData.requiresDepthTexture = depthOfField;
+            cameraData.renderPostProcessing = betterLight || depthOfField;
+            if (depthOfFieldEffect != null)
             {
-                sceneDepthEffect.mode.Override(sceneDepth ? DepthOfFieldMode.Gaussian : DepthOfFieldMode.Off);
-                float strength=textureQuality==TextureQualityLevel.High?HighTextureSceneDepthScale:
-                    textureQuality==TextureQualityLevel.Medium?0.55f:LowTextureSceneDepthScale;
-                sceneDepthEffect.gaussianMaxRadius.Override(OriginalSceneDepthRadius*strength);
+                depthOfFieldEffect.mode.Override(depthOfField ? DepthOfFieldMode.Gaussian : DepthOfFieldMode.Off);
+                float strength=textureQuality==TextureQualityLevel.High?HighTextureDepthOfFieldScale:
+                    textureQuality==TextureQualityLevel.Medium?0.55f:LowTextureDepthOfFieldScale;
+                depthOfFieldEffect.gaussianMaxRadius.Override(OriginalDepthOfFieldRadius*strength);
             }
         }
 
         private void ApplyFog() => WorldBootstrap.ApplyFogState(fog);
 
-        private void ApplyTextureQuality()
+        private void ApplyTextureQuality(bool refreshRenderers=true)
         {
-            ColorOnlyTextureQuality.SetQuality(textureQuality);
+            ColorOnlyTextureQuality.SetQuality(textureQuality,refreshRenderers);
             if(cameraData!=null) ApplyLighting();
-            // Texture quality also controls the requested Scene Depth strength.
+            // Texture quality also controls the requested Depth of Field strength.
             // During initialization the volume is assigned immediately afterward.
-            if(sceneDepthEffect!=null) ApplySceneDepth();
+            if(depthOfFieldEffect!=null) ApplyDepthOfField();
         }
 
         private void ApplyResolution()
@@ -750,9 +903,10 @@ namespace Wyvernland
             PlayerPrefs.SetInt("Options.Mute", muted ? 1 : 0);
             PlayerPrefs.SetFloat("Options.Fov", player.PlayerCamera.fieldOfView);
             PlayerPrefs.SetInt("Options.BetterLight", betterLight ? 1 : 0);
-            PlayerPrefs.SetInt("Options.SceneDepth", sceneDepth ? 1 : 0);
+            PlayerPrefs.SetInt("Options.DepthOfField", depthOfField ? 1 : 0);
             PlayerPrefs.SetInt("Options.Fog", fog ? 1 : 0);
             PlayerPrefs.SetInt("Options.TextureQuality",(int)textureQuality);
+            PlayerPrefs.SetFloat("Options.LoadingRange",loadingRange);
             PlayerPrefs.SetInt("Options.VSync", QualitySettings.vSyncCount != 0 ? 1 : 0);
             PlayerPrefs.Save();
         }
@@ -760,13 +914,30 @@ namespace Wyvernland
         private void Quit()
         {
             if (sessionStarted) PlayerSaveSystem.Save(player);
+#if UNITY_WEBGL && !UNITY_EDITOR
+            ReturnToMainMenu();
+            WebBrowserSession.ReturnToWebsite();
+#else
             Resume(); // Restore time and audio before leaving Play mode.
 #if UNITY_EDITOR
             UnityEditor.EditorApplication.isPlaying = false;
 #else
             Application.Quit();
 #endif
+#endif
         }
+
+#if UNITY_WEBGL && !UNITY_EDITOR
+        private void OnApplicationFocus(bool focused)
+        {
+            if (!focused && initialized)
+            {
+                if (sessionStarted) PlayerSaveSystem.Save(player);
+                Save();
+                if (page == Page.Closed) OpenPause();
+            }
+        }
+#endif
 
         private void OnApplicationQuit()
         {
@@ -816,7 +987,7 @@ namespace Wyvernland
             {
                 if (Button("ENTER WYVERNLAND"))
                 {
-                    if (WorldBootstrap.TestGround) WorldBootstrap.SelectMap(false);
+                    if (startMenuOnly || WorldBootstrap.TestGround) WorldBootstrap.SelectMap(false);
                     else EnterGame();
                 }
                 if (Button("TEST GROUND"))
@@ -828,7 +999,11 @@ namespace Wyvernland
                     optionsRoot = Page.Main;
                     page = Page.Options;
                 }
+#if UNITY_WEBGL && !UNITY_EDITOR
+                if (Button("BACK TO WEBSITE")) Quit();
+#else
                 if (Button("QUIT")) Quit();
+#endif
             }
             else if (page == Page.Pause)
             {
@@ -839,7 +1014,11 @@ namespace Wyvernland
                     page = Page.Options;
                 }
                 if (Button("Return to Menu")) ReturnToMainMenu();
+#if UNITY_WEBGL && !UNITY_EDITOR
+                if (Button("Back to Website")) Quit();
+#else
                 if (Button("Quit Game")) Quit();
+#endif
             }
             else if (page == Page.Options)
             {
@@ -853,13 +1032,12 @@ namespace Wyvernland
                 if (page == Page.Graphic)
                 {
                     graphicScroll = GUILayout.BeginScrollView(graphicScroll, GUILayout.Height(485));
-                    if (streaming != null)
-                    {
-                        GUILayout.Label($"Loading Range: {streaming.LoadingRange:0} m", label);
-                        float range = Mathf.Round(GUILayout.HorizontalSlider(streaming.LoadingRange, 50f, 3000f) / 5f) * 5f;
-                        if (!Mathf.Approximately(range, streaming.LoadingRange)) streaming.SetRange(range);
-                        GUILayout.Label($"Physics and grass within {range:0} m; objects visible within {range * 2f:0} m.", label);
-                    }
+                    GUILayout.Label($"Object Loading Range: {loadingRange:0} m",label);
+                    float range=Mathf.Round(GUILayout.HorizontalSlider(loadingRange,
+                        PlayerWorldLoading.MinimumRange,PlayerWorldLoading.MaximumRange)/25f)*25f;
+                    if(!Mathf.Approximately(range,loadingRange)) { loadingRange=range;PlayerWorldLoading.SetSavedRange(range); }
+                    GUILayout.Label($"Terrain Loading Range: {loadingRange*PlayerWorldLoading.TerrainRangeMultiplier:0} m",label);
+                    GUILayout.Label("Moving objects stay loaded, with a 20 m collision area around them.",label);
                     if(grass!=null)
                     {
                         GUILayout.Label($"Grass Density: {grass.Density*100f:0}%",label);
@@ -882,16 +1060,19 @@ namespace Wyvernland
                         betterLight = !betterLight;
                         ApplyLighting();
                     }
-                    if (Button("Scene Depth: " + (sceneDepth ? "On" : "Off")))
+                    if (Button("Depth of Field: " + (depthOfField ? "On" : "Off")))
                     {
-                        sceneDepth = !sceneDepth;
-                        ApplySceneDepth();
+                        depthOfField = !depthOfField;
+                        ApplyDepthOfField();
                     }
                     if (Button("Fog: " + (fog ? "On" : "Off")))
                     {
                         fog = !fog;
                         ApplyFog();
                     }
+#if UNITY_WEBGL && !UNITY_EDITOR
+                    GUILayout.Label("The game fits your browser window. Use Fullscreen for more space.", label);
+#else
                     Vector2Int size = resolutions[resolutionIndex];
                     GUILayout.Label($"Resolution: {size.x} × {size.y}", label);
                     GUILayout.BeginHorizontal();
@@ -904,21 +1085,28 @@ namespace Wyvernland
                     GUI.enabled = wasEnabled;
                     if (Application.isEditor)
                         GUILayout.Label("Resolution is controlled by Unity's Game view while in the Editor.", label);
+#endif
                     GUILayout.Label($"Field of view: {player.PlayerCamera.fieldOfView:0}°", label);
                     player.PlayerCamera.fieldOfView = GUILayout.HorizontalSlider(player.PlayerCamera.fieldOfView, 60f, 100f);
                     GUILayout.EndScrollView();
                 }
                 else if (page == Page.Keybinding)
                 {
+                    keybindingScroll=GUILayout.BeginScrollView(keybindingScroll,GUILayout.Height(485));
                     for (int i = 0; i < player.Bindings.Length; i++)
                         if (Button(FirstPersonController.BindingNames[i] + "  —  " +
-                            (binding == i ? "Press a key…" : player.Bindings[i].ToString()+
+                            (binding == i ? "Press a key…" : (player.Bindings[i]==Key.Backquote?"`":player.Bindings[i].ToString())+
                             (i==6&&player.Bindings[i]==Key.C?" / LeftCtrl":""))))
                             binding = i;
+                    if(Button("Aim / Left pickup  —  "+
+                        (binding==FirstPersonController.AimBindingIndex?
+                            "Press a key or Right Mouse…":player.AimBindingName)))
+                        binding=FirstPersonController.AimBindingIndex;
                     GUILayout.Label(binding >= 0 ? "Esc cancels. Duplicate keys swap actions." : "Select an action to change its key.", label);
                     GUILayout.Label($"Mouse sensitivity: {player.Sensitivity:0.00}", label);
                     player.Sensitivity = GUILayout.HorizontalSlider(player.Sensitivity, 0.03f, 0.4f);
                     if (Button("Reset bindings")) { player.ResetBindings(); binding = -1; }
+                    GUILayout.EndScrollView();
                 }
                 else if (page == Page.Audio)
                 {

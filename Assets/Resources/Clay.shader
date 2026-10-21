@@ -3,10 +3,13 @@ Shader "Wyvernland/Unfired Clay"
     Properties
     {
         _BaseColor ("Clay color", Color) = (0.43,0.16,0.075,1)
+        [HideInInspector] _DarkWoodColor ("Dark woodland color", Color) = (0.1,0.04,0.02,1)
         [Toggle] _TerrainColorRegions ("Terrain color regions", Float) = 0
         [HideInInspector] _LowTextureQuality ("Low texture quality", Float) = 0
         [HideInInspector] _MediumTextureQuality ("Medium texture quality", Float) = 0
         [Toggle] _UseVertexColor ("Use vertex color", Float) = 0
+        [HideInInspector] _ResidentPropDraw ("Resident prop draw", Float) = 0
+        [HideInInspector] _FlatTerrainNormal ("Flat terrain faces", Float) = 0
         [HideInInspector] _UseTerrainPitColor ("Stone pit shading", Float) = 0
         [Enum(UnityEngine.Rendering.CullMode)] _Cull ("Cull", Float) = 2
     }
@@ -20,22 +23,25 @@ Shader "Wyvernland/Unfired Clay"
         #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/CommonMaterial.hlsl"
         CBUFFER_START(UnityPerMaterial)
         half4 _BaseColor;
-            float4 _DarkWoods[4];
             half4 _DarkWoodColor;
             float _TerrainColorRegions;
             float _LowTextureQuality;
             float _MediumTextureQuality;
             float _UseVertexColor;
+            float _ResidentPropDraw;
+            float _FlatTerrainNormal;
             float _UseTerrainPitColor;
-            int _RiverbedPointCount;
-            float4 _RiverbedPoints[80];
         CBUFFER_END
+        TEXTURE3D(_ClayNoise); SAMPLER(sampler_ClayNoise);
+        TEXTURE2D(_TerrainRegionMap); SAMPLER(sampler_TerrainRegionMap);
         ENDHLSL
         Pass
         {
             Tags { "LightMode"="UniversalForwardOnly" }
             Cull [_Cull]
             HLSLPROGRAM
+            #pragma multi_compile_instancing
+            #include_with_pragmas "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DOTS.hlsl"
             #pragma vertex Vert
             #pragma fragment Frag
             #pragma multi_compile_fog
@@ -46,10 +52,11 @@ Shader "Wyvernland/Unfired Clay"
             float _WyvernBetterLighting;
             float4 _WyvernFogColor;
             float4 _WyvernFogParams;
-            struct Attributes { float4 positionOS:POSITION; float3 normalOS:NORMAL; half4 color:COLOR; };
-            struct Varyings { float4 positionCS:SV_POSITION; float3 world:TEXCOORD0; half3 normal:TEXCOORD1; half fog:TEXCOORD2; half4 color:COLOR; };
+            struct Attributes { float4 positionOS:POSITION; float3 normalOS:NORMAL; half4 color:COLOR; UNITY_VERTEX_INPUT_INSTANCE_ID };
+            struct Varyings { float4 positionCS:SV_POSITION; float3 world:TEXCOORD0; half3 normal:TEXCOORD1; half fog:TEXCOORD2; half4 color:COLOR; UNITY_VERTEX_INPUT_INSTANCE_ID };
             Varyings Vert(Attributes v)
             {
+                UNITY_SETUP_INSTANCE_ID(v);
                 Varyings o;
                 o.world=TransformObjectToWorld(v.positionOS.xyz);
                 o.positionCS=TransformWorldToHClip(o.world);
@@ -67,158 +74,56 @@ Shader "Wyvernland/Unfired Clay"
             }
             float Noise(float3 p)
             {
-                float3 i=floor(p), f=frac(p); f=f*f*(3-2*f);
-                return lerp(lerp(lerp(Hash(i),Hash(i+float3(1,0,0)),f.x),
-                    lerp(Hash(i+float3(0,1,0)),Hash(i+float3(1,1,0)),f.x),f.y),
-                    lerp(lerp(Hash(i+float3(0,0,1)),Hash(i+float3(1,0,1)),f.x),
-                    lerp(Hash(i+float3(0,1,1)),Hash(i+float3(1,1,1)),f.x),f.y),f.z);
-            }
-            float RegionBand(float2 p,float2 a,float2 b,float radius,float feather)
-            {
-                float2 edge=b-a;
-                float t=saturate(dot(p-a,edge)/max(dot(edge,edge),0.0001));
-                float distanceFromBand=length(p-a-edge*t);
-                // Most of each marked region is a transition. Only the innermost
-                // quarter reaches the maximum tint strength.
-                float fullTintRadius=radius*0.24;
-                return 1-smoothstep(fullTintRadius,radius+feather,distanceFromBand);
-            }
-            float RiverbedSegment(float2 p,float2 a,float2 b,float widthA,float widthB)
-            {
-                float2 edge=b-a;
-                float t=saturate(dot(p-a,edge)/max(dot(edge,edge),0.0001));
-                float distanceFromBed=length(p-a-edge*t);
-                float radius=lerp(widthA,widthB,t)*0.5;
-                return 1-smoothstep(radius*0.55,radius+5.25,
-                    distanceFromBed);
-            }
-            float RiverbedMask(float2 p)
-            {
-                float weight=0;
-                [loop] for(int index=0;index<79;index++)
-                {
-                    if(index+1>=_RiverbedPointCount) break;
-                    float4 a=_RiverbedPoints[index];
-                    if(a.w<0.5) continue;
-                    float4 b=_RiverbedPoints[index+1];
-                    weight=max(weight,RiverbedSegment(p,a.xy,b.xy,a.z,b.z));
-                }
-                return weight;
-            }
-            void AddRegion(inout float weight,inout half3 weightedColor,
-                float amount,half3 color)
-            {
-                weight+=amount;
-                weightedColor+=color*amount;
+                float3 fraction=frac(p);
+                fraction=fraction*fraction*(3-2*fraction);
+                return SAMPLE_TEXTURE3D_LOD(_ClayNoise,sampler_ClayNoise,
+                    (floor(p)+fraction+0.5)/64,0).r;
             }
             half3 TerrainRegionColor(float3 world,half3 original,half3 normal)
             {
-                // Convert world position back to the 1368 x 1824 reference-photo
-                // coordinates used to trace both the coastline and color marks.
-                float2 photo=float2(40+(world.x+2500)/5000*1210,
-                    1660-(world.z+3250)/6500*1510);
-                const half3 grey=half3(0.37,0.36,0.33);
-                const half3 redBrown=half3(0.52,0.12,0.085);
-                const half3 yellowBrown=half3(0.66,0.40,0.17);
-                float greyWeight=0,redWeight=0,yellowWeight=0;
-
-                // Grey areas.
-                greyWeight=max(greyWeight,RegionBand(photo,float2(900,270),float2(965,295),35,18));
-                greyWeight=max(greyWeight,RegionBand(photo,float2(445,900),float2(550,840),70,22));
-                greyWeight=max(greyWeight,RegionBand(photo,float2(965,925),float2(1045,1060),66,22));
-                greyWeight=max(greyWeight,RegionBand(photo,float2(842,1215),float2(842,1370),55,20));
-
-                // Red-brown areas.
-                redWeight=max(redWeight,RegionBand(photo,float2(225,855),float2(305,795),57,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(305,795),float2(395,745),62,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(395,745),float2(475,700),62,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(475,700),float2(515,625),58,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(515,625),float2(515,555),55,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(325,1245),float2(400,1175),58,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(400,1175),float2(420,1090),62,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(420,1090),float2(520,1020),60,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(520,1020),float2(650,975),58,22));
-                redWeight=max(redWeight,RegionBand(photo,float2(650,975),float2(745,925),52,22));
-
-                // Yellow-brown areas.
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(405,660),float2(400,565),37,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(400,565),float2(445,495),39,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(445,495),float2(535,450),37,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(920,775),float2(1025,735),38,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(1025,735),float2(1090,665),38,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(1090,665),float2(1120,570),36,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(405,980),float2(405,850),32,17));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(405,1300),float2(450,1200),36,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(450,1200),float2(455,1100),38,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(455,1100),float2(540,1050),38,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(540,1050),float2(650,1020),38,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(650,1020),float2(770,965),36,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(1090,1150),float2(1130,1050),36,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(1130,1050),float2(1120,900),38,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(1120,900),float2(1115,830),35,18));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(780,1395),float2(775,1290),31,16));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(775,1290),float2(790,1215),31,16));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(860,275),float2(860,275),34,17));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(1005,310),float2(1005,310),34,17));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(435,1530),float2(435,1530),34,17));
-                yellowWeight=max(yellowWeight,RegionBand(photo,float2(540,1540),float2(540,1540),34,17));
-
-                half3 weighted=0;
-                float total=0;
-                AddRegion(total,weighted,greyWeight,grey);
-                AddRegion(total,weighted,redWeight,redBrown);
-                AddRegion(total,weighted,yellowWeight,yellowBrown);
-                half3 mixed=weighted/max(total,0.0001);
-                // Painted colors affect upward terrain faces and blend back to the
-                // original clay across the soft boundary of every traced mark.
-                // The traced palette is a restrained tint over the original clay,
-                // rather than a replacement for it.
-                float upward=smoothstep(-0.12,0.28,normal.y);
-                float influence=saturate(total)*upward*
-                    saturate(_TerrainColorRegions)*0.096;
-                half3 regional=lerp(original,mixed,influence);
-                const half3 darkBrown=half3(0.18,0.065,0.025);
-                float riverInfluence=RiverbedMask(world.xz)*upward*
-                    saturate(_TerrainColorRegions)*0.30;
-                regional=lerp(regional,darkBrown,riverInfluence);
-                float woods=0;
-                for(int w=0;w<4;w++)
-                {
-                    float2 radius=max(_DarkWoods[w].zw,float2(0.001,0.001));
-                    float d=length((world.xz-_DarkWoods[w].xy)/radius);
-                    woods=max(woods,1-smoothstep(0.85,1,d));
-                }
-                return lerp(regional,_DarkWoodColor.rgb,woods*0.5*saturate(_TerrainColorRegions));
+                if(_TerrainColorRegions<0.5) return original;
+                float2 uv=(world.xz+float2(2500,3250))/float2(5000,6500);
+                half4 region=SAMPLE_TEXTURE2D(_TerrainRegionMap,sampler_TerrainRegionMap,uv);
+                half3 regional=lerp(original,region.rgb,smoothstep(-0.12,0.28,normal.y));
+                return lerp(regional,_DarkWoodColor.rgb,region.a*0.5);
             }
             half4 Frag(Varyings i):SV_Target
             {
                 half3 n=normalize(i.normal);
+                if(_FlatTerrainNormal>.5)
+                {
+                    half3 face=normalize(cross(ddy(i.world),ddx(i.world)));
+                    n=dot(face,n)<0?-face:face;
+                }
+                half3 objectBase=lerp(_BaseColor.rgb,i.color.rgb,
+                    saturate(_UseVertexColor)*i.color.a);
+                if(_ResidentPropDraw>.5&&_LowTextureQuality>.5) return half4(objectBase,1);
                 #if defined(_MAIN_LIGHT_SHADOWS_SCREEN)
                     float4 shadowCoord=ComputeScreenPos(TransformWorldToHClip(i.world));
                 #else
                     float4 shadowCoord=TransformWorldToShadowCoord(i.world);
                 #endif
                 Light sun=GetMainLight(shadowCoord,i.world,half4(1,1,1,1));
+                if(_ResidentPropDraw>.5&&_MediumTextureQuality>.5)
+                {
+                    float lit=min(sun.shadowAttenuation,step(.18,dot(n,sun.direction)));
+                    return half4(objectBase*lerp(.55,1,step(.75,lit)),1);
+                }
                 AmbientOcclusionFactor ao=GetScreenSpaceAmbientOcclusion(GetNormalizedScreenSpaceUV(i.positionCS));
                 // Real diffuse sunlight and sky irradiance, with no glossy/specular lobe.
                 half3 direct=sun.color*saturate(dot(n,sun.direction))*
                     sun.distanceAttenuation*sun.shadowAttenuation*ao.directAmbientOcclusion;
                 half3 ambient=max(SampleSH(n),half3(0,0,0))*ao.indirectAmbientOcclusion;
-                half3 objectBase=lerp(_BaseColor.rgb,i.color.rgb,
-                    saturate(_UseVertexColor)*i.color.a);
                 half3 regionalBase=TerrainRegionColor(i.world,objectBase,n);
                 // Terrain vertices mark excavated stone interiors; ordinary ground is white.
                 regionalBase*=lerp(half3(1,1,1),i.color.rgb,saturate(_UseTerrainPitColor));
                 half3 simpleLighting=(0.42+0.58*saturate(dot(n,sun.direction)))*half3(1,0.96,0.90);
                 half3 lighting=lerp(simpleLighting,direct+ambient,saturate(_WyvernBetterLighting));
+                half3 naturalLighting=lighting;
                 if(_MediumTextureQuality>0.5)
                 {
-                    // Medium keeps the biome blend, then places one discrete
-                    // shadow value over it without adding surface color detail.
-                    float inShadow=min(sun.shadowAttenuation,
-                        step(0.18,dot(n,sun.direction)));
-                    lighting=lerp(half3(0.55,0.55,0.55),half3(1,1,1),
-                        step(0.75,inShadow));
+                    float inShadow=min(sun.shadowAttenuation,step(0.18,dot(n,sun.direction)));
+                    lighting=lerp(half3(0.55,0.55,0.55),half3(1,1,1),step(0.75,inShadow));
                 }
                 half3 clay=regionalBase;
                 if(_LowTextureQuality<0.5&&_MediumTextureQuality<0.5)
@@ -264,15 +169,18 @@ Shader "Wyvernland/Unfired Clay"
             ZTest LEqual
             ColorMask 0
             HLSLPROGRAM
+            #pragma multi_compile_instancing
+            #include_with_pragmas "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DOTS.hlsl"
             #pragma vertex ShadowVert
             #pragma fragment ShadowFrag
             #pragma multi_compile_vertex _ _CASTING_PUNCTUAL_LIGHT_SHADOW
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
             float3 _LightDirection;
             float3 _LightPosition;
-            struct Attributes { float4 positionOS:POSITION; float3 normalOS:NORMAL; };
+            struct Attributes { float4 positionOS:POSITION; float3 normalOS:NORMAL; UNITY_VERTEX_INPUT_INSTANCE_ID };
             float4 ShadowVert(Attributes v):SV_POSITION
             {
+                UNITY_SETUP_INSTANCE_ID(v);
                 float3 world=TransformObjectToWorld(v.positionOS.xyz);
                 float3 normal=TransformObjectToWorldNormal(v.normalOS);
                 #if defined(_CASTING_PUNCTUAL_LIGHT_SHADOW)
@@ -298,9 +206,13 @@ Shader "Wyvernland/Unfired Clay"
             ZWrite On
             ColorMask R
             HLSLPROGRAM
+            #pragma multi_compile_instancing
+            #include_with_pragmas "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DOTS.hlsl"
             #pragma vertex DepthVert
             #pragma fragment DepthFrag
-            float4 DepthVert(float4 p:POSITION):SV_POSITION { return TransformObjectToHClip(p.xyz); }
+            struct DepthInput { float4 vertex:POSITION; UNITY_VERTEX_INPUT_INSTANCE_ID };
+            float4 DepthVert(DepthInput input):SV_POSITION
+            { UNITY_SETUP_INSTANCE_ID(input); return TransformObjectToHClip(input.vertex.xyz); }
             half DepthFrag(float4 p:SV_POSITION):SV_Target { return p.z; }
             ENDHLSL
         }
@@ -310,22 +222,31 @@ Shader "Wyvernland/Unfired Clay"
             Tags { "LightMode"="DepthNormalsOnly" }
             ZWrite On
             HLSLPROGRAM
+            #pragma multi_compile_instancing
+            #include_with_pragmas "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DOTS.hlsl"
             #pragma vertex NormalsVert
             #pragma fragment NormalsFrag
             #pragma multi_compile_fragment _ _GBUFFER_NORMALS_OCT
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"
-            struct Attributes { float4 positionOS:POSITION; float3 normalOS:NORMAL; };
-            struct Varyings { float4 positionCS:SV_POSITION; half3 normal:TEXCOORD0; };
+            struct Attributes { float4 positionOS:POSITION; float3 normalOS:NORMAL; UNITY_VERTEX_INPUT_INSTANCE_ID };
+            struct Varyings { float4 positionCS:SV_POSITION; half3 normal:TEXCOORD0; float3 world:TEXCOORD1; };
             Varyings NormalsVert(Attributes v)
             {
+                UNITY_SETUP_INSTANCE_ID(v);
                 Varyings o;
                 o.positionCS=TransformObjectToHClip(v.positionOS.xyz);
                 o.normal=TransformObjectToWorldNormal(v.normalOS);
+                o.world=TransformObjectToWorld(v.positionOS.xyz);
                 return o;
             }
             half4 NormalsFrag(Varyings i):SV_Target
             {
                 float3 n=normalize(i.normal);
+                if(_FlatTerrainNormal>.5)
+                {
+                    float3 face=normalize(cross(ddy(i.world),ddx(i.world)));
+                    n=dot(face,n)<0?-face:face;
+                }
                 #if defined(_GBUFFER_NORMALS_OCT)
                     float2 oct=PackNormalOctQuadEncode(n);
                     return half4(PackFloat2To888(saturate(oct*0.5+0.5)),0);
