@@ -37,7 +37,7 @@ namespace Wyvernland.Editor
             LeftDropAimValidation.Run();
             PlayerNeckMeshSeal.Validate();HeldStoneMovementValidation.Run();LegDamageStagesValidation.Run();PresentationAndFragmentValidation.Run();ThrowSafetyValidation.Run();InteractionRefinementValidation.Run();RoomThrowAndJointValidation.Run();ExtendedBodyDestructionValidation.Run();BodyPersistenceValidation.Run();
             PlayerDamageValidation.Run();
-            PartialHeadShatterValidation.Run();
+            HeadShatterValidation.Run();
             TrainingDummyValidation.Run();
             RoomObjectPhysicsValidation.Run();
             HumanRigValidation.RunInteractionFixValidation();

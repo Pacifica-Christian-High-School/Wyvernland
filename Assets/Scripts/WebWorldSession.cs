@@ -342,6 +342,9 @@ namespace Wyvernland
             if(!item.Pending) {
                 item.ClaimSnapshot=current.Capture(item,false,null);
                 item.Pending=true;current.pendingClaims.Add(item);
+                // A reach has already selected this object's local pose. Stop
+                // interpolating an older room sample while the hand travels.
+                current.motion.Remove(item.Id);
                 current.RequestAction(new Request { action="claim",@object=item.Id,state=item.ClaimSnapshot });
             }
             // Show an eligible local grip immediately. Only confirmed ownership
@@ -691,9 +694,10 @@ namespace Wyvernland
             }
             string owner=state.holder??"";
             bool locallyHeld=item.Target.GetComponent<PickableObject>() is { IsHeld:true };
-            if(item.Pending&&(locallyHeld||item.PendingRelease!=null)&&string.IsNullOrEmpty(owner)) {
-                // A read sent before the claim can arrive after hand contact.
-                // Keep its pose for rollback without pulling the local grip away.
+            if(item.Pending&&string.IsNullOrEmpty(owner)) {
+                // A read sent before the claim can arrive during the reach or
+                // after hand contact. Keep it for rollback without moving the
+                // selected object away from the hand.
                 item.ClaimSnapshot=state;item.Last=state;return;
             }
             if(item.Pending&&!string.IsNullOrEmpty(owner)&&owner!=self) {
@@ -847,7 +851,7 @@ namespace Wyvernland
             if(ready&&!WorldLoading.IsLoading) Time.timeScale=1f;
             foreach(string id in motion.ToArray()) {
                 if(!items.TryGetValue(id,out var item)||item.Target==null||item.Last==null) { motion.Remove(id);continue; }
-                if(item.OutgoingRelease!=null||IsHost&&!item.Last.held||item.Pending&&item.PendingRelease!=null||
+                if(item.OutgoingRelease!=null||IsHost&&!item.Last.held||item.Pending||
                     (item.Owner==self||item.Pending)&&item.Target.GetComponent<PickableObject>() is { IsHeld:true }) { motion.Remove(id);continue; }
                 if(item.Corpse!=null) { motion.Remove(id);continue; }
                 var position=Vector(item.Last.p);var rotation=Rotation(item.Last.q);

@@ -50,7 +50,7 @@ namespace Wyvernland.Editor
                     body.position=shape.bounds.center+direction*3;body.linearVelocity=-direction*300;Physics.SyncTransforms();
                     int before=damage.Capture().hit;Invoke(motion,"FixedUpdate");
                     Check(damage.Capture().hit>before,"tiny fast projectile cannot tunnel through "+part);
-                    Check(part==PlayerBodyPart.Head?!damage.IsDead&&damage.Capture().headFaces.Length==1:part==PlayerBodyPart.Legs?damage.CanMove&&damage.MovementSpeedScale==.75f:part==PlayerBodyPart.Torso?damage.Capture().pits.Length>0:damage.CanUseHand(part==PlayerBodyPart.LeftArm)&&damage.ArmMovementSpeed(part==PlayerBodyPart.LeftArm)==1f&&damage.ArmAnimationSwingAmount(part==PlayerBodyPart.LeftArm)==.8f,"sweep damages the contacted region: "+part);
+                    Check(part==PlayerBodyPart.Head?damage.IsDead:part==PlayerBodyPart.Legs?damage.CanMove&&damage.MovementSpeedScale==.75f:part==PlayerBodyPart.Torso?damage.Capture().pits.Length>0:damage.CanUseHand(part==PlayerBodyPart.LeftArm)&&damage.ArmMovementSpeed(part==PlayerBodyPart.LeftArm)==1f&&damage.ArmAnimationSwingAmount(part==PlayerBodyPart.LeftArm)==.8f,"sweep damages the contacted region: "+part);
                 }
                 damage.Respawn();
                 var head=dummy.GetComponentsInChildren<PlayerHitShape>().First(t=>t.Part==PlayerBodyPart.Head).GetComponent<Collider>();
@@ -60,9 +60,7 @@ namespace Wyvernland.Editor
                 body.position=head.bounds.center+new Vector3(3,3,0);body.linearVelocity=Vector3.down*300;Physics.SyncTransforms();Invoke(motion,"FixedUpdate");
                 Check(!damage.IsDead,"fast near miss cannot cause damage");
                 for(int i=0;i<4;i++) {
-                    damage.Respawn();Check(damage.ReceiveImpact(PlayerBodyPart.Head,source.GetComponent<Collider>(),head.bounds.center,Vector3.down,Vector3.down*100)&&!damage.IsDead,"first head hit fixture");
-                    var second=UnityEngine.Object.Instantiate(source);second.transform.position+=Vector3.right;
-                    Check(damage.ReceiveImpact(PlayerBodyPart.Head,second.GetComponent<Collider>(),head.bounds.center,Vector3.down,Vector3.down*100)&&damage.IsDead,"second head hit fixture");
+                    damage.Respawn();Check(damage.ReceiveImpact(PlayerBodyPart.Head,source.GetComponent<Collider>(),head.bounds.center,Vector3.down,Vector3.down*100)&&damage.IsDead,"single head hit fixture");
                 }
                 var bodies=UnityEngine.Object.FindObjectsByType<PlayerCorpse>(FindObjectsSortMode.None);
                 Check(bodies.Length>=4,"more than three deaths preserve old corpses");

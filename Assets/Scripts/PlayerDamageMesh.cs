@@ -9,94 +9,6 @@ namespace Wyvernland
     // resulting surface and cavity vertex so the pit continues to bend with skin.
     public static class PlayerDamageMesh
     {
-        internal static int ClosestHeadFace(SkinnedMeshRenderer skin,Mesh source,Vector3 hit,IReadOnlyCollection<int> removed)
-        {
-            if(skin==null||source==null||!source.isReadable) return -1;
-            var world=WorldMesh(skin,source,out _);
-            try {
-                var points=world.vertices;Vector3 center=world.bounds.center;
-                Vector3 ray=(hit-center).normalized;
-                float best=float.PositiveInfinity;int selected=-1,ordinal=0;
-                for(int slot=0;slot<world.subMeshCount;slot++) {
-                    var triangles=world.GetTriangles(slot);
-                    for(int t=0;t+2<triangles.Length;t+=3,ordinal++) {
-                        if(removed!=null&&removed.Contains(ordinal)) continue;
-                        Vector3 a=points[triangles[t]],b=points[triangles[t+1]],c=points[triangles[t+2]];
-                        Vector3 nearest=PickableObject.ClosestTrianglePoint(hit,a,b,c);
-                        Vector3 midpoint=(a+b+c)/3f;
-                        float score=(nearest-hit).sqrMagnitude+
-                            .05f*Vector3.Cross(midpoint-center,ray).sqrMagnitude;
-                        if(score<best) { best=score;selected=ordinal; }
-                    }
-                }
-                return selected;
-            } finally { PlayerDamage.Release(world); }
-        }
-
-        internal static Mesh RemoveHeadFaces(Mesh source,IReadOnlyCollection<int> removed)
-        {
-            if(source==null) return null;
-            var result=UnityEngine.Object.Instantiate(source);result.name="Head with separated faces";
-            var points=source.vertices.ToList();var weights=source.boneWeights.ToList();
-            var uv=source.uv.Length==source.vertexCount?source.uv.ToList():
-                Enumerable.Repeat(Vector2.zero,source.vertexCount).ToList();
-            var slots=new List<int[]>();
-            int ordinal=0;
-            for(int slot=0;slot<source.subMeshCount;slot++) {
-                var triangles=source.GetTriangles(slot);var remaining=new List<int>(triangles.Length);
-                for(int t=0;t+2<triangles.Length;t+=3,ordinal++) {
-                    int a=triangles[t],b=triangles[t+1],c=triangles[t+2];
-                    if(removed==null||!removed.Contains(ordinal)) {
-                        remaining.Add(a);remaining.Add(b);remaining.Add(c);continue;
-                    }
-                    // Leave a shallow, closed wound rather than a transparent
-                    // triangle through the head. The inset shares skin weights.
-                    Vector3 center=(points[a]+points[b]+points[c])/3f;
-                    Vector3 inward=(source.bounds.center-center).normalized*.012f;
-                    if(inward.sqrMagnitude<.000001f)
-                        inward=-Vector3.Cross(points[b]-points[a],points[c]-points[a]).normalized*.012f;
-                    int d=points.Count;
-                    foreach(int index in new[]{a,b,c}) {
-                        points.Add(points[index]+inward);weights.Add(weights[index]);uv.Add(uv[index]);
-                    }
-                    remaining.AddRange(new[]{d,d+1,d+2,
-                        a,b,d+1,a,d+1,d,
-                        b,c,d+2,b,d+2,d+1,
-                        c,a,d,c,d,d+2});
-                }
-                slots.Add(remaining.ToArray());
-            }
-            result.SetVertices(points);result.boneWeights=weights.ToArray();result.SetUVs(0,uv);
-            for(int slot=0;slot<slots.Count;slot++) result.SetTriangles(slots[slot],slot,false);
-            result.RecalculateNormals();result.RecalculateBounds();return result;
-        }
-
-        internal static void SpawnHeadFace(SkinnedMeshRenderer skin,Mesh source,int face,Vector3 incoming,string identity,Transform owner)
-        {
-            if(face<0||skin==null||source==null) return;
-            var world=WorldMesh(skin,source,out _);
-            try {
-                int ordinal=0;
-                for(int slot=0;slot<world.subMeshCount;slot++) {
-                    var triangles=world.GetTriangles(slot);var points=world.vertices;var uv=world.uv;
-                    for(int t=0;t+2<triangles.Length;t+=3,ordinal++) if(ordinal==face) {
-                        Vector3 a=points[triangles[t]],b=points[triangles[t+1]],c=points[triangles[t+2]];
-                        Vector3 inward=(world.bounds.center-(a+b+c)/3f).normalized*.012f;
-                        var piece=new Mesh { name="Separated head face" };
-                        piece.vertices=new[]{a,b,c,a+inward,b+inward,c+inward};
-                        Vector2 U(int index)=>uv.Length==world.vertexCount?uv[index]:Vector2.zero;
-                        piece.uv=new[]{U(triangles[t]),U(triangles[t+1]),U(triangles[t+2]),
-                            U(triangles[t]),U(triangles[t+1]),U(triangles[t+2])};
-                        piece.triangles=new[]{0,1,2,5,4,3,0,3,4,0,4,1,1,4,5,1,5,2,2,5,3,2,3,0};
-                        piece.RecalculateNormals();piece.RecalculateBounds();
-                        ColorOnlyTextureQuality.GetOriginalAppearance(skin,out var materials,out _);
-                        var material=materials!=null&&materials.Length>0?materials[Mathf.Min(slot,materials.Length-1)]:null;
-                        BodyFragment.Spawn(piece,new[]{material},incoming,identity+":head-face",owner);
-                        return;
-                    }
-                }
-            } finally { PlayerDamage.Release(world); }
-        }
         static Matrix4x4 Blend(BoneWeight w,Matrix4x4[] matrices)
         {
             var result=new Matrix4x4();
@@ -249,37 +161,6 @@ namespace Wyvernland
                 if(result==null) { skin.enabled=false;continue; }skin.sharedMesh=result;owned.Add(result);
             }
         }
-        internal static bool PartiallyShatterHead(SkinnedMeshRenderer skin,Vector3 velocity,List<Mesh> owned,string identity,Transform owner,bool spawnFragments)
-        {
-            var source=skin.sharedMesh;if(source==null||!source.isReadable||source.boneWeights.Length!=source.vertexCount) return false;
-            var bounds=source.bounds;
-            // Keep the lower 65% attached to the neck. Cut in bind space so
-            // remote reconstruction retains the same head regardless of ragdoll pose.
-            var plane=new Plane(Vector3.up,new Vector3(bounds.center.x,bounds.min.y+bounds.size.y*.65f,bounds.center.z));
-            if(!DestructionMesh.Split(source,plane,out var a,out var b)) { PlayerDamage.Release(a);PlayerDamage.Release(b);return false; }
-            var remainder=a.bounds.center.y<b.bounds.center.y?a:b;
-            var detached=remainder==a?b:a;
-            if(remainder.vertexCount<3||remainder.triangles.Length<3) { PlayerDamage.Release(a);PlayerDamage.Release(b);return false; }
-            void Bind(Mesh mesh) {
-                var original=source.vertices;var originalWeights=source.boneWeights;var points=mesh.vertices;
-                var exact=new Dictionary<Vector3,BoneWeight>();for(int j=0;j<original.Length;j++) exact[original[j]]=originalWeights[j];
-                var weights=new BoneWeight[points.Length];
-                for(int i=0;i<points.Length;i++) {
-                    if(exact.TryGetValue(points[i],out var existing)) { weights[i]=existing;continue; }
-                    int nearest=0;float distance=float.PositiveInfinity;
-                    for(int j=0;j<original.Length;j++) { float d=(original[j]-points[i]).sqrMagnitude;if(d<distance) { distance=d;nearest=j; } }
-                    weights[i]=originalWeights[nearest];
-                }
-                mesh.boneWeights=weights;mesh.bindposes=source.bindposes;
-            }
-            Bind(remainder);Bind(detached);remainder.name="Partially shattered head remainder";
-            try {
-                if(spawnFragments) { skin.sharedMesh=detached;Shatter(skin,velocity,owned,identity,owner); }
-            } finally { skin.sharedMesh=remainder;owned.Add(remainder);PlayerDamage.Release(detached); }
-            skin.enabled=true;
-            return true;
-        }
-
         public static void Shatter(SkinnedMeshRenderer skin,Vector3 velocity,List<Mesh> owned,string identity=null,Transform owner=null)
         {
             var world=WorldMesh(skin,out _);var pieces=new List<Mesh>{world};var bounds=world.bounds;

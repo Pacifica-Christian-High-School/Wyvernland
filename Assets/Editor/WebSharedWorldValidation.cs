@@ -11,9 +11,31 @@ namespace Wyvernland.Editor
         [MenuItem("Tools/Wyvernland/Validate Shared World")]
         public static void Run()
         {
-            GameObject sourceRoot=null,replicaRoot=null;
+            GameObject sourceRoot=null,replicaRoot=null,pendingRoot=null;
             var sourceFragments=new System.Collections.Generic.List<GameObject>();
             try {
+                var pendingWorld=Fixture(out pendingRoot,out GameObject reachingStone);
+                pendingWorld.ReceiveWorld("{\"self\":\"host\",\"host\":\"host\",\"ready\":true}");
+                var prior=pendingWorld.CaptureForValidation(reachingStone).objects[0];
+                prior.revision=1;prior.writer="visitor";prior.p[0]+=1f;
+                pendingWorld.ReceiveWorld(JsonUtility.ToJson(new WebWorldSession.Packet {
+                    self="host",host="host",ready=true,objects=new[]{prior} }));
+                var selectedPosition=reachingStone.transform.position;
+                Require(WebWorldSession.TryClaim(reachingStone.GetComponent<PickableObject>()),
+                    "A room pickup reach can reserve the selected object");
+                var delayed=pendingWorld.CaptureForValidation(reachingStone).objects[0];
+                delayed.revision=2;delayed.writer="visitor";delayed.p[0]+=5f;
+                pendingWorld.ReceiveWorld(JsonUtility.ToJson(new WebWorldSession.Packet {
+                    self="host",host="host",ready=true,objects=new[]{delayed} }));
+                typeof(WebWorldSession).GetMethod("LateUpdate",System.Reflection.BindingFlags.Instance|
+                    System.Reflection.BindingFlags.NonPublic).Invoke(pendingWorld,null);
+                Require(Vector3.Distance(reachingStone.transform.position,selectedPosition)<.0001f,
+                    "Room position updates do not pull an object away during pickup reach");
+                pendingWorld.ReceiveWorld(JsonUtility.ToJson(new WebWorldSession.Packet {
+                    self="host",host="host",ready=true,claims=new[]{new WebWorldSession.Claim { id=delayed.id,owned=false }} }));
+                Require(Mathf.Abs(reachingStone.transform.position.x-delayed.p[0])<.0001f,
+                    "A rejected pickup restores the latest room position");
+                UnityEngine.Object.DestroyImmediate(pendingRoot);pendingRoot=null;
                 var pickupWorld=Fixture(out sourceRoot,out GameObject pickedTree,true);
                 pickupWorld.ReceiveWorld("{\"self\":\"host\",\"host\":\"host\",\"ready\":true}");
                 var guestPickup=pickupWorld.CaptureForValidation(pickedTree).objects[0];
@@ -80,6 +102,7 @@ namespace Wyvernland.Editor
                 }
                 Debug.Log("SHARED_WORLD_VALIDATION_PASS: stable IDs, actual destruction, mesh codec, late join, held visibility, ownership, host physics transfer");
             } finally {
+                if(pendingRoot!=null) UnityEngine.Object.DestroyImmediate(pendingRoot);
                 if(sourceRoot!=null) UnityEngine.Object.DestroyImmediate(sourceRoot);
                 if(replicaRoot!=null) UnityEngine.Object.DestroyImmediate(replicaRoot);
                 foreach(var fragment in sourceFragments) if(fragment!=null) UnityEngine.Object.DestroyImmediate(fragment);

@@ -257,12 +257,7 @@ namespace Wyvernland.Editor
                     float lethalSpeed=Mathf.Max(40f,PlayerDamage.RequiredSpeed(lethalProperties)+1f);
                     Check(attacker.GetComponent<PlayerDamage>().ReceiveImpact(PlayerBodyPart.Head,
                         lethalSource.GetComponent<Collider>(),attacker.transform.position+Vector3.up,
-                        Vector3.right,Vector3.right*lethalSpeed)&&!attacker.GetComponent<PlayerDamage>().IsDead,
-                        "first NPC head hit separates a face without killing");
-                    var secondLethal=UnityEngine.Object.Instantiate(lethalSource);secondLethal.transform.position+=Vector3.up;
-                    Check(attacker.GetComponent<PlayerDamage>().ReceiveImpact(PlayerBodyPart.Head,
-                        secondLethal.GetComponent<Collider>(),attacker.transform.position+Vector3.up,
-                        Vector3.right,Vector3.right*lethalSpeed),"second NPC head hit creates a dead ragdoll");
+                        Vector3.right,Vector3.right*lethalSpeed),"one NPC head hit creates a dead ragdoll");
                     Check(attacker.GetComponent<PlayerDamage>().IsDead&&!bar.IsHeld&&
                         (bar.GetComponent<CorpseGrip>()?.IsAttached??false)==
                         (bar.GetComponent<CorpseGrip>()!=null),

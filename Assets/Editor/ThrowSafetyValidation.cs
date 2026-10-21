@@ -65,7 +65,7 @@ namespace Wyvernland.Editor
                 Physics.SyncTransforms();
                 var motion=MovingImpactMotion.Ensure(body);typeof(MovingImpactMotion).GetMethod("FixedUpdate",Hidden).Invoke(motion,null);
                 Check(!damage.IsDead&&damage.Capture().hit==hits,"sweep passes through the thrower's excluded body without injury");
-                Check(!dummy.Damage.IsDead&&dummy.Damage.Capture().headFaces.Length==1,
+                Check(dummy.Damage.IsDead,
                     "sweep continues past ignored own-body hits to the other actor's head");dummy.Damage.Respawn();
                 var session=new GameObject("Throw safety room").AddComponent<WebWorldSession>();session.transform.SetParent(root.transform,false);
                 var init=session.Initialize(root,player);while(init.MoveNext()){}

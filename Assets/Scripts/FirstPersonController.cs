@@ -31,7 +31,7 @@ namespace Wyvernland
         private const float StrikeLookSmoothing = 5f;
         private const float StrikeFastLookSpeedScale = 0.1512f;
         private const float StrikeFastLookSmoothing = 10f;
-        private const float StrikeLookRecoverySeconds = 1.5f;
+        private const float StrikeLookRecoverySeconds = 0.6f;
         private const float StrikeCameraBoostStartDegreesPerSecond = 25f;
         internal const float StrikeFullSpeedDegreesPerSecond = 140f;
 

@@ -109,12 +109,9 @@ namespace Wyvernland.Editor
             Check(pickup.IsHeld,"death fixture holds object");
             int headFragments=UnityEngine.Object.FindObjectsByType<BodyFragment>(FindObjectsSortMode.None).Length;
             Check(damage.ReceiveImpact(PlayerBodyPart.Head,collider,contact,Vector3.right,Vector3.right*(threshold+1))&&
-                !damage.IsDead&&damage.Capture().headFaces.Length==1,"first head hit separates one face without killing");
-            Check(UnityEngine.Object.FindObjectsByType<BodyFragment>(FindObjectsSortMode.None).Length==headFragments+1,
-                "first head hit produces exactly one fragment");
-            var fatalSource=UnityEngine.Object.Instantiate(source);fatalSource.transform.position=source.transform.position+Vector3.up;
-            Check(damage.ReceiveImpact(PlayerBodyPart.Head,fatalSource.GetComponent<Collider>(),contact,Vector3.right,Vector3.right*(threshold+1)),
-                "second head hit within three seconds kills");
+                damage.IsDead,"one qualifying head hit kills");
+            Check(UnityEngine.Object.FindObjectsByType<BodyFragment>(FindObjectsSortMode.None).Length>headFragments,
+                "fatal head hit produces shatter fragments");
             Check(damage.IsDead&&player.IsDead&&PlayerDamage.RespawnDelay==2,"death blocks input until two-second respawn");
             var corpse=UnityEngine.Object.FindFirstObjectByType<PlayerCorpse>();
             Check(corpse!=null&&corpse.GetComponent<PlayerRagdoll>().Bodies.All(b=>b==null||!b.isKinematic),"entire corpse is dynamic ragdoll");

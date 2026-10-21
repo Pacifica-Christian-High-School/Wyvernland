@@ -55,11 +55,8 @@ namespace Wyvernland.Editor
                     "torso loss stops at sixty percent and also slows weapon waving");
                 damage.Respawn();
                 float before=Time.unscaledTime;
-                Check(damage.ReceiveImpact(PlayerBodyPart.Head,hit,point,Vector3.right,Vector3.right*speed)&&!damage.IsDead&&damage.Capture().headFaces.Length==1,
-                    "first head destruction separates one face and leaves NPC alive");
-                var fatal=UnityEngine.Object.Instantiate(hit.gameObject);fatal.transform.SetParent(root.transform,true);
-                Check(damage.ReceiveImpact(PlayerBodyPart.Head,fatal.GetComponent<Collider>(),point,Vector3.right,Vector3.right*speed)&&damage.IsDead&&damage.Capture().corpses.Length==1,
-                    "second head destruction creates a full ragdoll corpse");
+                Check(damage.ReceiveImpact(PlayerBodyPart.Head,hit,point,Vector3.right,Vector3.right*speed)&&damage.IsDead&&damage.Capture().corpses.Length==1,
+                    "one head impact creates a fully shattered ragdoll corpse");
                 float at=(float)typeof(PlayerDamage).GetField("respawnAt",BindingFlags.Instance|BindingFlags.NonPublic).GetValue(damage);
                 Check(Mathf.Abs(at-before-2f)<.02f,"dummy uses the real two-second respawn timer");
                 dummy.transform.position+=Vector3.right*5;damage.Respawn();

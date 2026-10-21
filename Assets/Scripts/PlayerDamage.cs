@@ -141,7 +141,7 @@ namespace Wyvernland
         public const float RespawnDelay=2f;
         [Serializable] public sealed class Pit { public string id,bone;public Vector3 point,incoming; }
         [Serializable] public sealed class State {
-            public int injury,life,hit,severed,shockPhase,torsoHits;public bool fullPose;public float shockRemaining,recoveryRemaining,headWoundRemaining;public int[] limbHits,armHits,legHits,headFaces;public CorpseState[] limbs; public Pit[] pits; public float[] pose; public CorpseState[] corpses;public Impact[] impacts;public string[] received;
+            public int injury,life,hit,severed,shockPhase,torsoHits;public bool fullPose;public float shockRemaining,recoveryRemaining;public int[] limbHits,armHits,legHits;public CorpseState[] limbs; public Pit[] pits; public float[] pose; public CorpseState[] corpses;public Impact[] impacts;public string[] received;
         }
         [Serializable] public sealed class Impact {
             public string id,target,source,bone;public int life,part;public Vector3 point,normal,velocity;public float threshold,mass;
@@ -156,10 +156,6 @@ namespace Wyvernland
         readonly HashSet<string> receivedImpacts=new();
         readonly List<string> acknowledgements=new();
         readonly List<Pit> pits=new();
-        readonly List<int> headFaces=new();
-        Mesh currentHeadMesh;
-        float firstHeadHitAt=float.NegativeInfinity;
-        internal const float HeadDeathWindow=3f;
         readonly List<PlayerCorpse> corpses=new();
         readonly int[] limbHits=new int[4],armHits=new int[2],legHits=new int[2];readonly PlayerCorpse[] severedObjects=new PlayerCorpse[4];int severed;
         FirstPersonController controller;RiggedPlayerAvatar avatar;PlayerRagdoll ragdoll;
@@ -184,7 +180,7 @@ namespace Wyvernland
             if(!replica||next==null) return;
             if(life!=next.life) {
                 for(int i=0;i<skins.Length;i++) if(skins[i]!=null) { skins[i].sharedMesh=initialMeshes[i];skins[i].enabled=true; }
-                ReleaseHeadMesh();ragdoll.ResetPose();pits.Clear();headFaces.Clear();firstHeadHitAt=float.NegativeInfinity;torsoHits=0;severed=0;Array.Clear(armHits,0,2);Array.Clear(legHits,0,2);
+                ragdoll.ResetPose();pits.Clear();torsoHits=0;severed=0;Array.Clear(armHits,0,2);Array.Clear(legHits,0,2);
             }
             life=next.life;hit=next.hit;torsoHits=next.torsoHits;injury=(PlayerInjury)next.injury;replicaState=next;
             if(next.armHits?.Length==2) Array.Copy(next.armHits,armHits,2);
@@ -197,11 +193,6 @@ namespace Wyvernland
             if(next.pits!=null) while(pits.Count<next.pits.Length&&pits.Count<12) {
                 var pit=next.pits[pits.Count];pits.Add(pit);CutTorso(model,PitPoint(model,transform,pit),privateMeshes);
             }
-            if(next.headFaces!=null&&!headFaces.SequenceEqual(next.headFaces)) {
-                headFaces.Clear();headFaces.AddRange(next.headFaces);
-                ApplyHeadFaces();
-            }
-            firstHeadHitAt=next.headWoundRemaining>0f?Time.time-(HeadDeathWindow-next.headWoundRemaining):float.NegativeInfinity;
             foreach(var state in (next.corpses??Array.Empty<CorpseState>()).Concat(next.limbs??Array.Empty<CorpseState>())) {
                 if(WebWorldSession.IsCorpseRemoved(state.id)) continue;
                 var corpse=PlayerCorpse.Find(state.id);
@@ -439,9 +430,7 @@ if(state.limb>0) severedObjects[state.limb-1]=corpse;
                 case PlayerBodyPart.Torso:
                     torsoHits++;AddWound(part,point,ownVelocity);controller.RefreshInjuryLocomotion();break;
                 case PlayerBodyPart.Head:
-                    if(Time.time-firstHeadHitAt<=HeadDeathWindow) { Die(ownVelocity,point);return true; }
-                    firstHeadHitAt=Time.time;
-                    AddHeadWound(point,ownVelocity);
+                    Die(ownVelocity,point);
                     return true;
             }
             ragdoll.SetInjury(injury,ownVelocity,point);return true;
@@ -453,38 +442,6 @@ if(state.limb>0) severedObjects[state.limb-1]=corpse;
             var bone=shape!=null?shape.transform.parent:transform;
             var pit=new Pit { id=Guid.NewGuid().ToString("N"),bone=bone!=transform?bone.name:null,point=bone.InverseTransformPoint(point),incoming=incoming };
             pits.Add(pit);CutTorso(model,point,privateMeshes,pit.id,incoming,transform);
-        }
-        void AddHeadWound(Vector3 point,Vector3 incoming)
-        {
-            var head=skins.FirstOrDefault(s=>s!=null&&s.name=="HumanHead");
-            if(head==null) return;
-            int index=PlayerDamageMesh.ClosestHeadFace(head,initialMeshes[Array.IndexOf(skins,head)],point,headFaces);
-            if(index<0) return;
-            headFaces.Add(index);
-            PlayerDamageMesh.SpawnHeadFace(head,initialMeshes[Array.IndexOf(skins,head)],index,incoming,
-                Guid.NewGuid().ToString("N"),transform);
-            ApplyHeadFaces();
-        }
-        void ApplyHeadFaces()
-        {
-            var head=skins.FirstOrDefault(s=>s!=null&&s.name=="HumanHead");
-            if(head==null) return;
-            var source=initialMeshes[Array.IndexOf(skins,head)];
-            if(source==null) return;
-            if(headFaces.Count==0) {
-                foreach(var skin in skins) if(skin!=null&&skin.name.Contains("HumanHead")) skin.sharedMesh=source;
-                ReleaseHeadMesh();return;
-            }
-            var mesh=PlayerDamageMesh.RemoveHeadFaces(source,headFaces);
-            if(mesh==null) return;
-            ReleaseHeadMesh();currentHeadMesh=mesh;
-            privateMeshes.Add(mesh);
-            foreach(var skin in skins) if(skin!=null&&skin.name.Contains("HumanHead")) skin.sharedMesh=mesh;
-        }
-        void ReleaseHeadMesh()
-        {
-            if(currentHeadMesh==null) return;
-            privateMeshes.Remove(currentHeadMesh);Release(currentHeadMesh);currentHeadMesh=null;
         }
         void Update()
         {
@@ -551,14 +508,13 @@ if(state.limb>0) severedObjects[state.limb-1]=corpse;
         internal static bool ShouldDropHeldItem(float roll)=>roll<.7f;
         internal void Respawn()
         {
-            CancelShock();shockCooldowns.Clear();injury=PlayerInjury.None;life++;pits.Clear();headFaces.Clear();firstHeadHitAt=float.NegativeInfinity;torsoHits=0;cooldowns.Clear();severed=0;Array.Clear(limbHits,0,4);Array.Clear(armHits,0,2);Array.Clear(legHits,0,2);Array.Clear(severedObjects,0,4);
+            CancelShock();shockCooldowns.Clear();injury=PlayerInjury.None;life++;pits.Clear();torsoHits=0;cooldowns.Clear();severed=0;Array.Clear(limbHits,0,4);Array.Clear(armHits,0,2);Array.Clear(legHits,0,2);Array.Clear(severedObjects,0,4);
             for(int i=0;i<skins.Length;i++) if(skins[i]!=null) { skins[i].sharedMesh=initialMeshes[i];skins[i].enabled=true; }
-            ReleaseHeadMesh();
             ragdoll.ResetPose();model.gameObject.SetActive(true);avatar.enabled=true;
             foreach(var c in GetComponentsInChildren<Collider>()) if(c.name.Contains("Foot BoxCollider")) { c.transform.SetParent(transform,true);c.enabled=true; }
             controller.RespawnAfterDeath();hitBlinkStartedAt=float.NegativeInfinity;
         }
-        public State Capture() => new State { shockRemaining=shockRemaining,recoveryRemaining=recoveryRemaining,shockPhase=ShockPhase,fullPose=GetComponent<CombatNpc>()!=null,injury=(int)injury,life=life,hit=hit,severed=severed,torsoHits=torsoHits,headFaces=headFaces.ToArray(),headWoundRemaining=Mathf.Max(0f,HeadDeathWindow-(Time.time-firstHeadHitAt)),limbHits=(int[])limbHits.Clone(),armHits=(int[])armHits.Clone(),legHits=(int[])legHits.Clone(),limbs=severedObjects.Where(c=>c!=null&&!c.IsShattered).Select(c=>c.Capture(false)).ToArray(),pits=pits.ToArray(),
+        public State Capture() => new State { shockRemaining=shockRemaining,recoveryRemaining=recoveryRemaining,shockPhase=ShockPhase,fullPose=GetComponent<CombatNpc>()!=null,injury=(int)injury,life=life,hit=hit,severed=severed,torsoHits=torsoHits,limbHits=(int[])limbHits.Clone(),armHits=(int[])armHits.Clone(),legHits=(int[])legHits.Clone(),limbs=severedObjects.Where(c=>c!=null&&!c.IsShattered).Select(c=>c.Capture(false)).ToArray(),pits=pits.ToArray(),
             pose=IsShocked||GetComponent<CombatNpc>()!=null||injury!=PlayerInjury.None||armHits.Any(n=>n>0)||legHits.Any(n=>n>0)?ragdoll.CapturePose():null,corpses=corpses.Where(c=>c!=null&&!c.IsShattered).Select(c=>c.Capture(false)).ToArray(),impacts=WebPlayerPresence.CaptureImpacts(),received=acknowledgements.ToArray() };
         internal static bool CutTorso(Transform model,Vector3 point,List<Mesh> owned,string identity=null,Vector3 incoming=default,Transform owner=null)
         {

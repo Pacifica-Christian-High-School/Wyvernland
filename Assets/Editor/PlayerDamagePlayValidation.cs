@@ -53,15 +53,6 @@ namespace Wyvernland.Editor
                     MovingImpactMotion.Ensure(moving);moving.linearVelocity=Vector3.down*600;
                     Physics.SyncTransforms();started=Time.unscaledTime;phase=1;
                 } else if(phase==1) {
-                    if(!damage.IsDead&&damage.Capture().headFaces?.Length==1) {
-                        var head=damage.GetComponentsInChildren<PlayerHitShape>().First(t=>t.Part==PlayerBodyPart.Head).GetComponent<Collider>();
-                        var second=GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        second.transform.position=head.bounds.center+Vector3.up*2f;
-                        second.AddComponent<Rigidbody>().useGravity=false;
-                        PhysicalDestructible.Ensure(second);
-                        damage.ReceiveImpact(PlayerBodyPart.Head,second.GetComponent<Collider>(),
-                            head.bounds.center,Vector3.down,Vector3.down*600);
-                    }
                     if(damage.IsDead) { permanentCorpse=UnityEngine.Object.FindObjectsByType<PlayerCorpse>(FindObjectsSortMode.None).First();died=Time.unscaledTime;phase=2; }
                     else if(Time.unscaledTime-started>1.5f) throw new InvalidOperationException("A real fast moving object did not shatter the contacted head");
                 } else if(phase==2) {
